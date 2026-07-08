@@ -227,6 +227,8 @@ export interface Translations {
     openSettings: string
     openStarmap: string
     openKeybinds: string
+    layoutEditor: string
+    layoutEditorTitle: string
   }
 
   keybinds: {

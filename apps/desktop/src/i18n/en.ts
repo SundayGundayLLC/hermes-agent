@@ -184,7 +184,9 @@ export const en: Translations = {
     unmuteHaptics: 'Unmute haptics',
     openSettings: 'Open settings',
     openStarmap: 'Open memory graph',
-    openKeybinds: 'Keyboard shortcuts'
+    openKeybinds: 'Keyboard shortcuts',
+    layoutEditor: 'Layout editor',
+    layoutEditorTitle: 'Layout editor — ⌘-click resets the layout'
   },
 
   keybinds: {

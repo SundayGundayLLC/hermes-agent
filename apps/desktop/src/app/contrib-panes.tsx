@@ -1,7 +1,6 @@
 /**
  * Real-data panes + composable bar items for the contrib root:
  *
- *  - `LogsPane` — live tail of the real agent log (`GET /api/logs`, 5s poll).
  *  - `PreviewRailPane` — the REAL ChatPreviewRail; files-pane clicks feed it.
  *  - `FilesPane` — real file browser; activating a file opens it in preview.
  *  - Core statusbar items with LIVE store-backed labels, registered as DATA
@@ -32,7 +31,8 @@ import { $filePreviewTarget, $previewTarget, setCurrentSessionPreviewTarget } fr
 import { $currentCwd } from '@/store/session'
 
 // ---------------------------------------------------------------------------
-// Logs — real agent log tail
+// Logs — live agent-log tail. OPTIONAL chrome: not in any default layout,
+// hidden until the ⌘K "Toggle logs" command opens it ($logsOpen).
 // ---------------------------------------------------------------------------
 
 export function LogsPane() {

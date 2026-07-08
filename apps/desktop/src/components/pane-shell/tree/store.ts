@@ -293,7 +293,10 @@ export function bindTreeSideVisibility(
   $open.listen(open => setTreeSideCollapsed(side, !open))
 }
 
-/** The root-row side `paneId` currently sits on, relative to the main zone. */
+/** The chrome toggle owning `paneId`'s root-row column — SEMANTIC, matching
+ *  the renderer's `rootChildSide`: ⌘B ⇔ the sessions column (left-placement
+ *  panes) wherever it sits, ⌘J ⇔ the other side columns. Null for the main
+ *  column (never side-collapsed). */
 export function treeSideOfPane(paneId: string): TreeSide | null {
   const tree = $layoutTree.get()
 
@@ -301,16 +304,22 @@ export function treeSideOfPane(paneId: string): TreeSide | null {
     return null
   }
 
-  const mainPane = registry.getArea('panes').find(c => (c.data as { placement?: string } | undefined)?.placement === 'main')?.id
-  const indexOf = (id?: string) => (id ? tree.children.findIndex(child => allPaneIds(child).includes(id)) : -1)
-  const pane = indexOf(paneId)
-  const main = indexOf(mainPane)
+  const child = tree.children.find(node => allPaneIds(node).includes(paneId))
 
-  if (pane < 0 || main < 0 || pane === main) {
+  if (!child) {
     return null
   }
 
-  return pane < main ? 'left' : 'right'
+  const placementOf = (id: string) =>
+    (registry.getArea('panes').find(c => c.id === id)?.data as { placement?: string } | undefined)?.placement
+
+  const placements = allPaneIds(child).map(placementOf)
+
+  if (placements.includes('main')) {
+    return null
+  }
+
+  return placements.includes('left') ? 'left' : 'right'
 }
 
 /**

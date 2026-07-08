@@ -172,6 +172,26 @@ export function subtreeGone(node: LayoutNode, ctx: TrackContext): boolean {
 }
 
 /**
+ * Which chrome toggle owns a root-row child — SEMANTIC, not positional:
+ * ⌘B is the sessions/nav column (any `placement: 'left'` pane) wherever a
+ * flip or drag puts it; ⌘J is every other side column. `null` = contains
+ * the main zone, never side-collapsed. This is what keeps the titlebar
+ * toggles and reveals 100% main-compatible through ⌘\ flips.
+ */
+export function rootChildSide(
+  child: LayoutNode,
+  paneFor: (id: string) => Contribution | undefined
+): 'left' | 'right' | null {
+  const placements = allPaneIds(child).map(id => paneChrome(paneFor(id)).placement)
+
+  if (placements.includes('main')) {
+    return null
+  }
+
+  return placements.includes('left') ? 'left' : 'right'
+}
+
+/**
  * The FIXED zone that owns `edge` of this subtree along `axis` — the zone a
  * sash on that boundary actually resizes (dragging the seam between main and
  * a nested right section resizes the section's edge sidebar, VS Code-style).

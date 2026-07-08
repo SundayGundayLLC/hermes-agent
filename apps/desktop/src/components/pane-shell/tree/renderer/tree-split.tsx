@@ -34,6 +34,7 @@ import {
   paneChrome,
   type PaneSizing,
   resolveCssPx,
+  rootChildSide,
   subtreeGone,
   type TrackContext
 } from './track-model'
@@ -287,17 +288,21 @@ export function TreeSplit({ node, root }: { node: SplitNode; root?: boolean }) {
   // leftover, VS Code style.
   const isMinimized = (child: LayoutNode) => child.type === 'group' && Boolean(child.minimized)
 
-  // Positional side collapse (titlebar toggles): at the ROOT row, children
-  // left/right of the main zone hide with their side — whatever panes have
-  // been rearranged there. In edit mode sides stay visible (you're editing).
-  const mainIndex =
-    root && horizontal && collapsedSides.size > 0 && !editMode
-      ? node.children.findIndex(child => allPaneIds(child).some(id => paneChrome(paneFor(id)).placement === 'main'))
-      : -1
+  // SEMANTIC side collapse (titlebar toggles / ⌘B / ⌘J): at the ROOT row,
+  // ⌘B owns the sessions column and ⌘J the other side columns — by pane
+  // placement, NOT position, so a ⌘\ flip moves the columns without
+  // rewiring the toggles (main parity). In edit mode sides stay visible.
+  const semanticSides = root && horizontal && collapsedSides.size > 0 && !editMode
 
-  const sideGone = (i: number) =>
-    mainIndex >= 0 &&
-    (i < mainIndex ? collapsedSides.has('left') : i > mainIndex && collapsedSides.has('right'))
+  const sideGone = (i: number) => {
+    if (!semanticSides) {
+      return false
+    }
+
+    const side = rootChildSide(node.children[i], paneFor)
+
+    return side !== null && collapsedSides.has(side)
+  }
 
   // One pass per child: collapse/minimize state, resolved fixed track, clamps,
   // and narrow-unmount flag. fixedTrackSize + subtreeGone each re-walk the

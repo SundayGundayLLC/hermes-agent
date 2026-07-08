@@ -19,7 +19,6 @@ import {
   setTreePaneHidden,
   watchContributedPanes
 } from '@/components/pane-shell/tree/store'
-import { Button } from '@/components/ui/button'
 import { SidebarProvider } from '@/components/ui/sidebar'
 import { discoverBundledPlugins } from '@/contrib/plugins'
 import { Slot } from '@/contrib/react/slot'
@@ -27,7 +26,8 @@ import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
 import { LayoutDashboard } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
-import { readKey, writeKey } from '@/lib/storage'
+import { Codecs, persistentAtom } from '@/lib/persisted'
+import { toggleKeybindPanel } from '@/store/keybinds'
 import {
   $fileBrowserOpen,
   $panesFlipped,
@@ -144,6 +144,8 @@ registry.registerMany([
     render: () => <ReviewPaneContent />
   },
   {
+    // Optional chrome — in NO default layout. Adoption stacks it with the
+    // terminal; $logsOpen (default off, ⌘K "Toggle logs") reveals it.
     id: 'logs',
     area: 'panes',
     title: 'logs',
@@ -160,19 +162,10 @@ registry.registerMany([
 // auto-discovered by discoverBundledPlugins() below.
 // ---------------------------------------------------------------------------
 
-function ResetLayoutButton() {
-  return (
-    <Button className="[-webkit-app-region:no-drag]" onClick={resetLayoutTree} size="sm" variant="outline">
-      reset layout
-    </Button>
-  )
-}
-
 registry.registerMany([
   // The session-title dropdown (rename/pin/branch/delete) — the real app's
   // chat header, living in the titlebar's center slot over the workspace.
   { id: 'session-title', area: 'titleBar.center', order: 0, render: () => <WiredPane part="sessionTitle" /> },
-  { id: 'reset-layout', area: 'titleBar.right', order: 0, render: () => <ResetLayoutButton /> },
   // Layout edit mode registers through the SAME declarative surfaces plugins
   // use: a rebindable keybind (collision-checked in the panel) + a ⌘K row
   // whose hotkey hint tracks the live binding.
@@ -209,6 +202,28 @@ registry.registerMany([
       keywords: ['plugins', 'reload', 'refresh', 'desktop'],
       run: () => void discoverRuntimePlugins()
     } satisfies PaletteContribution
+  },
+  {
+    id: 'layout.reset',
+    area: PALETTE_AREA,
+    data: {
+      id: 'layout.reset',
+      label: 'Reset layout',
+      icon: LayoutDashboard,
+      keywords: ['layout', 'reset', 'default', 'panes'],
+      run: resetLayoutTree
+    } satisfies PaletteContribution
+  },
+  // The keybind panel's non-titlebar door (the keyboard icon is gone).
+  {
+    id: 'keybinds.panel',
+    area: PALETTE_AREA,
+    data: {
+      id: 'keybinds.panel',
+      label: 'Keyboard shortcuts',
+      keywords: ['keybinds', 'shortcuts', 'hotkeys', 'keyboard'],
+      run: toggleKeybindPanel
+    } satisfies PaletteContribution
   }
 ])
 
@@ -234,7 +249,7 @@ const DEFAULT_TREE = split(
           [1, 1.2],
           'spl-rail'
         ),
-        group(['terminal', 'logs'], { id: 'grp-terminal' })
+        group(['terminal'], { id: 'grp-terminal' })
       ],
       [1.6, 1],
       'spl-right'
@@ -246,7 +261,7 @@ const DEFAULT_TREE = split(
 
 const FOCUS_TREE = split(
   'row',
-  [group(['sessions']), group(['workspace', 'files', 'preview', 'review', 'terminal', 'logs'])],
+  [group(['sessions']), group(['workspace', 'files', 'preview', 'review', 'terminal'])],
   [1, 4.6]
 )
 
@@ -254,7 +269,7 @@ const TERMINAL_TREE = split(
   'column',
   [
     split('row', [group(['sessions']), group(['workspace']), group(['files', 'preview', 'review'])], [1, 3.2, 1.2]),
-    group(['terminal', 'logs'])
+    group(['terminal'])
   ],
   [3, 1]
 )
@@ -263,7 +278,7 @@ const QUAD_TREE = split(
   'column',
   [
     split('row', [group(['sessions', 'files']), group(['workspace'])], [1, 3]),
-    split('row', [group(['terminal']), group(['logs', 'preview', 'review'])], [1.4, 1])
+    split('row', [group(['terminal']), group(['preview', 'review'])], [1.4, 1])
   ],
   [3, 1]
 )
@@ -309,16 +324,6 @@ function bindPaneVisibility(
   if (close) {
     registerPaneCloser(paneId, close)
   }
-}
-
-// The legacy file-browser pane state ships CLOSED by default, but the tree's
-// default layout puts files in the rail — zones you laid out should exist.
-// Seed it open once; every later toggle is the user's and sticks.
-const FILES_SEEDED_KEY = 'hermes.desktop.contrib.filesSeeded.v1'
-
-if (!readKey(FILES_SEEDED_KEY)) {
-  setFileBrowserOpen(true)
-  writeKey(FILES_SEEDED_KEY, '1')
 }
 
 // SIDES have one source of truth: the TREE. The legacy $panesFlipped flag is
@@ -389,6 +394,22 @@ const $previewVisible = computed([$previewTarget, $filePreviewTarget], (target, 
 )
 
 bindPaneVisibility('preview', $previewVisible, closeRightRail)
+
+// Logs are optional chrome: off by default, toggled from ⌘K, persisted.
+const $logsOpen = persistentAtom('hermes.desktop.logsOpen', false, Codecs.bool)
+
+bindPaneVisibility('logs', $logsOpen, () => $logsOpen.set(false))
+registry.register({
+  id: 'logs.toggle',
+  area: PALETTE_AREA,
+  data: {
+    id: 'logs.toggle',
+    label: 'Toggle logs',
+    keywords: ['logs', 'agent log', 'tail', 'debug'],
+    run: () => $logsOpen.set(!$logsOpen.get())
+  } satisfies PaletteContribution
+})
+
 // Sessions' visibility is the LEFT-side toggle's job — Close just collapses
 // the side (⌘B truthful, titlebar button flips back).
 registerPaneCloser('sessions', () => setSidebarOpen(false))
