@@ -43,9 +43,11 @@ import {
   uploadAttachment
 } from './api'
 import {
+  columnMeta,
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
+  type KanbanEvent,
   type KanbanTaskDetail,
   SEVERITY_TONE
 } from './types'
@@ -59,8 +61,112 @@ import {
   ScrollFade,
   Section,
   shortId,
-  StatusMenu
+  StatusMenu,
+  useDefaultAssignee
 } from './ui'
+
+/**
+ * Turn a task_events row into an operator-readable line. The backend logs
+ * machine payloads ("status" + {"status":"ready"}); rendering the raw kind
+ * made the feed useless ("status · 2 sec. ago" after a drag). Known kinds get
+ * prose with the payload folded in; unknown kinds fall back to kind + compact
+ * key=value detail so new backend events still say something.
+ */
+function eventText(event: KanbanEvent): { detail?: string; label: string } {
+  let p: Record<string, unknown> = {}
+
+  if (typeof event.payload === 'string' && event.payload) {
+    try {
+      p = JSON.parse(event.payload) as Record<string, unknown>
+    } catch {
+      return { label: event.kind.replace(/_/g, ' '), detail: event.payload }
+    }
+  } else if (event.payload && typeof event.payload === 'object') {
+    p = event.payload as Record<string, unknown>
+  }
+
+  const str = (key: string): null | string => {
+    const value = p[key]
+
+    return typeof value === 'string' && value ? value : null
+  }
+
+  const col = (key: string) => {
+    const value = str(key)
+
+    return value ? columnMeta(value).label : null
+  }
+
+  switch (event.kind) {
+    case 'created': {
+      const where = col('status')
+      const assignee = str('assignee')
+
+      return {
+        label: `created${where ? ` in ${where}` : ''}${assignee ? ` · assigned to ${assignee}` : ''}`
+      }
+    }
+
+    case 'status': {
+      const reason = str('reason')
+
+      return {
+        label: `moved to ${col('status') ?? '?'}`,
+        detail: reason === 'parent_reopened' ? `parent ${str('parent') ?? ''} reopened` : (reason ?? undefined)
+      }
+    }
+
+    case 'assigned': {
+      const assignee = str('assignee')
+
+      return { label: assignee ? `assigned to ${assignee}` : 'unassigned' }
+    }
+
+    case 'commented':
+      return { label: `comment by ${str('author') ?? 'someone'}` }
+
+    case 'claimed':
+      return { label: str('source_status') === 'review' ? 'claimed by a review agent' : 'claimed by a worker' }
+
+    case 'spawned':
+      return { label: 'worker started', detail: p.pid != null ? `pid ${p.pid}` : undefined }
+
+    case 'completed':
+      return { label: 'completed' }
+
+    case 'blocked':
+      return { label: 'blocked — needs human input', detail: str('reason') ?? undefined }
+
+    case 'unblocked':
+      return { label: `unblocked${col('status') ? ` → ${col('status')}` : ' → Ready'}` }
+
+    case 'reclaimed':
+      return { label: 'reclaimed — returned to the queue', detail: str('reason') ?? undefined }
+
+    case 'specified':
+      return { label: 'spec written by the triage agent' }
+
+    case 'promoted':
+      return { label: 'dependencies done — promoted to Ready' }
+
+    case 'scheduled':
+      return { label: 'scheduled for later', detail: str('reason') ?? undefined }
+
+    case 'archived':
+      return { label: 'archived' }
+
+    case 'reprioritized':
+      return { label: `priority set to ${p.priority ?? '?'}` }
+    default: {
+      const detail = Object.entries(p)
+        .filter(([, value]) => value != null && typeof value !== 'object')
+        .map(([key, value]) => `${key}=${String(value)}`)
+        .join(' ')
+
+      return { label: event.kind.replace(/_/g, ' '), detail: detail || undefined }
+    }
+  }
+}
 
 function MetaRow({ children, label }: { children: ReactNode; label: string }) {
   return (
@@ -350,6 +456,7 @@ export function TaskDrawer({
 
   const task = detail?.task
   const running = task?.status === 'running'
+  const defaultAssignee = useDefaultAssignee()
 
   const { data: log } = useQuery({
     enabled: !!id,
@@ -544,6 +651,25 @@ export function TaskDrawer({
               {running && task.worker_pid ? <MetaRow label="Worker pid">{task.worker_pid}</MetaRow> : null}
             </div>
 
+            {task.status === 'ready' && !task.assignee && !defaultAssignee && (
+              <div
+                className="flex flex-col gap-1.5 rounded-md p-2.5"
+                style={{
+                  backgroundColor: `color-mix(in srgb, ${SEVERITY_TONE.warning} 7%, transparent)`,
+                  borderLeft: `2px solid ${SEVERITY_TONE.warning}`
+                }}
+              >
+                <div className="flex items-start gap-1.5 text-[0.75rem] font-medium" style={{ color: SEVERITY_TONE.warning }}>
+                  <Codicon className="mt-px shrink-0" name="warning" size="0.8rem" />
+                  Ready, but unassigned — this card will never run.
+                </div>
+                <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
+                  The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field
+                  above (or set a default assignee in the orchestration settings) and it runs within a minute.
+                </p>
+              </div>
+            )}
+
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={`Diagnostics · ${task.diagnostics.length}`}>
                 <Diagnostics
@@ -612,17 +738,21 @@ export function TaskDrawer({
               <Section label={`Activity · ${detail.events.length}`}>
                 <ScrollFade deps={detail.events.length} max="7rem">
                   <ul className="flex flex-col gap-1">
-                    {detail.events.map(event => (
-                      <li className="flex items-baseline gap-2 text-[0.6875rem]" key={event.id}>
-                        <span className="shrink-0 text-(--ui-text-secondary)">{event.kind.replace(/_/g, ' ')}</span>
-                        {typeof event.payload === 'string' && event.payload ? (
-                          <span className="min-w-0 truncate font-mono text-[0.625rem] text-(--ui-text-quaternary)">
-                            {event.payload}
-                          </span>
-                        ) : null}
-                        <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
-                      </li>
-                    ))}
+                    {detail.events.map(event => {
+                      const { detail: extra, label } = eventText(event)
+
+                      return (
+                        <li className="flex items-baseline gap-2 text-[0.6875rem]" key={event.id}>
+                          <span className="shrink-0 text-(--ui-text-secondary)">{label}</span>
+                          {extra && (
+                            <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)" title={extra}>
+                              {extra}
+                            </span>
+                          )}
+                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
+                        </li>
+                      )
+                    })}
                   </ul>
                 </ScrollFade>
               </Section>

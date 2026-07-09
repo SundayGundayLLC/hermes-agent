@@ -1,10 +1,11 @@
 /**
  * The Kanban board page — mounted at `/kanban` (a ROUTES_AREA contribution) in
  * the workspace pane. The desktop port of the dashboard board: one compact
- * header row (count, filter kebab, search, attention chip, nudge, settings,
- * new task — the board SWITCHER lives in the titlebar, see board-switcher.tsx),
- * columns in BOARD_COLUMNS order, drag-to-move (optimistic, workflow-checked),
- * right-click actions, and the detail drawer.
+ * header row (count, filter kebab, search, settings, new task — the board
+ * SWITCHER lives in the titlebar, see board-switcher.tsx), columns in
+ * BOARD_COLUMNS order, drag-to-move (optimistic, workflow-checked),
+ * ⌘-click multi-select with a floating bulk bar, right-click actions, and
+ * the detail drawer. Dispatch nudges ride every write (see api.ts).
  */
 
 import {
@@ -41,23 +42,33 @@ import {
   Textarea,
   Tip,
   TITLEBAR_AREAS,
+  useGrabScroll,
   useMutation,
   useQuery,
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import {
+  type CSSProperties,
+  type DragEvent as ReactDragEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 
 import {
   $boardSlug,
+  $collapsedLanes,
   $introDismissed,
   $lanesByProfile,
   boardKey,
+  bulkTasks,
   createTask,
   deleteTask,
   fetchBoard,
   fetchProfiles,
-  nudgeDispatcher,
   patchTask,
   PROFILES_KEY
 } from './api'
@@ -65,7 +76,20 @@ import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { OrchestrationPanel } from './orchestration'
 import { columnMeta, type KanbanBoard, type KanbanTask } from './types'
-import { ago, Avatar, errText, isLockedTarget, LOCKED_COLUMNS, shortId } from './ui'
+import {
+  ago,
+  ARC_TITLES,
+  type ArcState,
+  arcState,
+  Avatar,
+  errText,
+  isLockedTarget,
+  LOCKED_COLUMNS,
+  RunClock,
+  shortId,
+  useDefaultAssignee,
+  useOrchestration
+} from './ui'
 
 // ── optimistic board edits (reconciled by the follow-up refresh) ─────────────
 
@@ -110,26 +134,71 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
   )
 }
 
-function CardFooter({ task }: { task: KanbanTask }) {
+function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const created = ago(task.created_at)
   const links = task.link_counts ? task.link_counts.parents + task.link_counts.children : 0
-  // The board's #1 silent failure: Ready + no assignee = the dispatcher will
-  // never claim it. Say so on the card instead of letting it sit mute.
-  const stranded = task.status === 'ready' && !task.assignee
+  const fallback = useDefaultAssignee()
+  const orchestrator = useOrchestration()?.resolved_orchestrator_profile ?? ''
+  // Ready + no assignee: with a configured default assignee the dispatcher
+  // auto-assigns on its next tick (#27145) — say THAT, not "won't run". Only
+  // a board with no fallback has the genuine silent failure.
+  const unassignedReady = task.status === 'ready' && !task.assignee
+
+  // The agent on the hook for a queued card: the explicit assignee, else the
+  // auto-default (ready), else the specifier that rewrites triage cards.
+  const attached =
+    task.assignee || (task.status === 'ready' ? fallback : task.status === 'triage' ? orchestrator : '')
+
+  const meta = columnMeta(task.status)
 
   return (
     <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
-      {task.assignee ? <Avatar name={task.assignee} size="1.125rem" /> : null}
-      {stranded && (
-        <Tip label="Ready cards only run once a profile is assigned. Open the card and set an assignee.">
+      {arc === 'queued' && attached ? (
+        // WHO is coming for the card. The arc only animates once the agent is
+        // actually working; while queued, the named chip carries "attached".
+        <Tip
+          label={
+            task.status === 'review'
+              ? 'A review agent is checking the completed work.'
+              : task.assignee
+                ? `${attached} is attached — the dispatcher hands this over on its next tick (≤1m).`
+                : task.status === 'triage'
+                  ? `${attached} (the orchestrator) picks this up on the next tick and writes the spec.`
+                  : `Auto-assigns to “${attached}” (kanban.default_assignee) on the next dispatch tick.`
+          }
+        >
+          <span className="inline-flex min-w-0 cursor-help items-center gap-1 font-medium" style={{ color: meta.tone }}>
+            <Avatar name={attached} size="1.125rem" />
+            <span className="truncate">
+              {!task.assignee && '→ '}
+              {attached}
+            </span>
+          </span>
+        </Tip>
+      ) : task.assignee ? (
+        <Avatar name={task.assignee} size="1.125rem" />
+      ) : null}
+      {arc === 'running' && (
+        <Tip label={ARC_TITLES.running}>
+          <span className="shrink-0 cursor-help">
+            <RunClock task={task} />
+          </span>
+        </Tip>
+      )}
+      {arc === 'stale' && (
+        <Tip label={ARC_TITLES.stale}>
+          <span className="shrink-0 cursor-help font-medium text-amber-500">no heartbeat</span>
+        </Tip>
+      )}
+      {unassignedReady && !fallback && (
+        <Tip label="Ready cards only run once a profile is assigned. Open the card and set an assignee, or configure a default assignee in orchestration settings.">
           <span className="inline-flex shrink-0 cursor-help items-center gap-1 text-amber-500">
             <Codicon name="debug-disconnect" size="0.7rem" />
             won't run
           </span>
         </Tip>
       )}
-      <span className="min-w-0 truncate font-mono text-(--ui-text-quaternary)">{shortId(task.id)}</span>
-      <div className="ml-auto flex shrink-0 items-center gap-2">
+      <div className="ml-auto flex min-w-0 shrink items-center gap-2">
         {typeof task.priority === 'number' && task.priority > 0 && (
           <span className="inline-flex items-center gap-0.5 text-amber-500">
             <Codicon name="arrow-up" size="0.7rem" />
@@ -149,7 +218,10 @@ function CardFooter({ task }: { task: KanbanTask }) {
             {task.warnings.count}
           </span>
         )}
-        {created && !task.assignee && !stranded ? <span className="text-(--ui-text-quaternary)">{created}</span> : null}
+        {created && !task.assignee && !unassignedReady ? (
+          <span className="text-(--ui-text-quaternary)">{created}</span>
+        ) : null}
+        <span className="min-w-0 truncate font-mono text-(--ui-text-quaternary)">{shortId(task.id)}</span>
       </div>
     </div>
   )
@@ -160,29 +232,39 @@ function Card({
   onDelete,
   onMove,
   onOpen,
+  onToggleSelect,
+  selected,
   task
 }: {
   columns: string[]
   onDelete: (id: string) => void
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
+  onToggleSelect: (id: string) => void
+  selected: boolean
   task: KanbanTask
 }) {
   const [dragging, setDragging] = useState(false)
   const meta = columnMeta(task.status)
   const summary = task.latest_summary || task.body
+  const fallback = useDefaultAssignee()
+  const arc = arcState(task, fallback)
 
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
           className={cn(
-            'group flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
-            'transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--ui-control-hover-background) active:cursor-grabbing',
+            'group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
+            // Hover matches the provider-picker rows: a quiet primary fill;
+            // selected = the theme's focus color (same as a focused input).
+            'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
+            selected &&
+              'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
             dragging && 'opacity-40'
           )}
           draggable
-          onClick={() => onOpen(task.id)}
+          onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
           onDragEnd={() => setDragging(false)}
           onDragStart={event => {
             event.dataTransfer.setData('text/plain', task.id)
@@ -192,21 +274,33 @@ function Card({
             event.dataTransfer.setDragImage(event.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY)
             setDragging(true)
           }}
-          style={{ borderLeftColor: meta.tone }}
+          style={{ '--kanban-tone': meta.tone, borderLeftColor: meta.tone } as CSSProperties}
         >
+          {/* Machine-activity arc: animates ONLY while an agent is actually on
+              the card (claimed + working; amber when the heartbeat is gone).
+              Queued attachment is the footer's named-agent chip — a moving
+              border on an idle card would lie. Hidden during drag/selection
+              so those states stay legible. */}
+          {(arc === 'running' || arc === 'stale') && !dragging && !selected && (
+            <span aria-hidden className={cn('kanban-arc', arc === 'stale' && 'kanban-arc--stale')} />
+          )}
           <span className="line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground">
             {task.title || task.id}
           </span>
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
-          <CardFooter task={task} />
+          <CardFooter arc={arc} task={task} />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
         <ContextMenuItem onSelect={() => onOpen(task.id)}>
           <Codicon name="link-external" size="0.85rem" />
           Open
+        </ContextMenuItem>
+        <ContextMenuItem onSelect={() => onToggleSelect(task.id)}>
+          <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
+          {selected ? 'Deselect' : 'Select (⌘-click)'}
         </ContextMenuItem>
         <ContextMenuSeparator />
         {columns
@@ -230,14 +324,19 @@ function Card({
 // ── column ───────────────────────────────────────────────────────────────────
 
 function Column({
+  collapsed,
   column,
   columns,
   onAdd,
   onDelete,
   onDropTask,
   onMove,
-  onOpen
+  onOpen,
+  onToggle,
+  onToggleSelect,
+  selected
 }: {
+  collapsed: boolean
   column: { name: string; tasks: KanbanTask[] }
   columns: string[]
   onAdd: (status: string) => void
@@ -245,6 +344,9 @@ function Column({
   onDropTask: (id: string, status: string) => void
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
+  onToggle: () => void
+  onToggleSelect: (id: string) => void
+  selected: ReadonlySet<string>
 }) {
   const [over, setOver] = useState(false)
   const meta = columnMeta(column.name)
@@ -268,39 +370,66 @@ function Column({
     return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))
   }, [byProfile, column])
 
+  const dragHandlers = {
+    onDragLeave: () => setOver(false),
+    onDragOver: (event: ReactDragEvent<HTMLElement>) => {
+      // Locked lanes don't preventDefault → the OS shows the no-drop cursor
+      // and the drop event never fires. The lane is honest about itself.
+      if (locked) {
+        event.dataTransfer.dropEffect = 'none'
+
+        return
+      }
+
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'move'
+      setOver(true)
+    },
+    onDrop: (event: ReactDragEvent<HTMLElement>) => {
+      event.preventDefault()
+      setOver(false)
+      const id = event.dataTransfer.getData('text/plain')
+
+      if (id) {
+        onDropTask(id, column.name)
+      }
+    }
+  }
+
+  const wash = over && !locked ? 'bg-(--ui-bg-quinary)' : 'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_50%,transparent)]'
+
+  // Collapsed = a thin vertical rail: dot, sideways label, count. Still a live
+  // drop target (drop straight onto the rail); click expands. The dot sits in
+  // the same h-5 header row as an expanded lane's, so dots align across the
+  // board regardless of collapse state.
+  if (collapsed) {
+    return (
+      <button
+        {...dragHandlers}
+        aria-label={`Expand ${meta.label}`}
+        className={cn('flex h-full w-8 shrink-0 flex-col items-center gap-1.5 rounded-lg p-2 transition-colors hover:bg-(--ui-bg-quinary)', wash)}
+        onClick={onToggle}
+        type="button"
+      >
+        <span className="grid h-5 shrink-0 place-items-center">
+          <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
+        </span>
+        <span className="text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary) [writing-mode:vertical-rl]">
+          {meta.label}
+        </span>
+        {column.tasks.length > 0 && (
+          <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{column.tasks.length}</span>
+        )}
+      </button>
+    )
+  }
+
   return (
     <div
-      className={cn(
-        'group/col flex h-full w-64 shrink-0 flex-col rounded-lg p-2 transition-colors',
-        over && !locked
-          ? 'bg-(--ui-bg-quinary)'
-          : 'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_50%,transparent)]'
-      )}
-      onDragLeave={() => setOver(false)}
-      onDragOver={event => {
-        // Locked lanes don't preventDefault → the OS shows the no-drop cursor
-        // and the drop event never fires. The lane is honest about itself.
-        if (locked) {
-          event.dataTransfer.dropEffect = 'none'
-
-          return
-        }
-
-        event.preventDefault()
-        event.dataTransfer.dropEffect = 'move'
-        setOver(true)
-      }}
-      onDrop={event => {
-        event.preventDefault()
-        setOver(false)
-        const id = event.dataTransfer.getData('text/plain')
-
-        if (id) {
-          onDropTask(id, column.name)
-        }
-      }}
+      {...dragHandlers}
+      className={cn('group/col flex h-full w-64 shrink-0 flex-col rounded-lg p-2 transition-colors', wash)}
     >
-      <header className="mb-1.5 flex items-center gap-1.5 px-1">
+      <header className="mb-1.5 flex h-5 items-center gap-1.5 px-1">
         <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
         <Tip label={meta.help}>
           <span className="cursor-help text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
@@ -308,6 +437,14 @@ function Column({
           </span>
         </Tip>
         <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{column.tasks.length}</span>
+        <button
+          aria-label={`Collapse ${meta.label}`}
+          className="ml-auto grid size-5 place-items-center rounded text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100 group-hover/col:opacity-100"
+          onClick={onToggle}
+          type="button"
+        >
+          <Codicon name="chevron-left" size="0.75rem" />
+        </button>
       </header>
       <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
         {lanes ? (
@@ -319,13 +456,31 @@ function Column({
                 <span className="tabular-nums">{tasks.length}</span>
               </div>
               {tasks.map(task => (
-                <Card columns={columns} key={task.id} onDelete={onDelete} onMove={onMove} onOpen={onOpen} task={task} />
+                <Card
+                  columns={columns}
+                  key={task.id}
+                  onDelete={onDelete}
+                  onMove={onMove}
+                  onOpen={onOpen}
+                  onToggleSelect={onToggleSelect}
+                  selected={selected.has(task.id)}
+                  task={task}
+                />
               ))}
             </div>
           ))
         ) : (
           column.tasks.map(task => (
-            <Card columns={columns} key={task.id} onDelete={onDelete} onMove={onMove} onOpen={onOpen} task={task} />
+            <Card
+              columns={columns}
+              key={task.id}
+              onDelete={onDelete}
+              onMove={onMove}
+              onOpen={onOpen}
+              onToggleSelect={onToggleSelect}
+              selected={selected.has(task.id)}
+              task={task}
+            />
           ))
         )}
         {/* Jira-style lane add — dashed, faded in on lane hover. Opacity (not
@@ -354,6 +509,7 @@ function Column({
 // ── dialogs ──────────────────────────────────────────────────────────────────
 
 const NO_PARENT = '__none__'
+const PARKED = '__parked__'
 const WORKSPACE_KINDS = ['scratch', 'worktree', 'dir'] as const
 
 function Field({ children, label }: { children: ReactNode; label: string }) {
@@ -378,6 +534,10 @@ function NewTaskDialog({
 }) {
   const qc = useQueryClient()
   const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
+  // Title-only creates must RUN: "auto" resolves to the orchestration default
+  // (ultimately the active profile), applied at create time. Never silently
+  // unassigned — parking a card is the explicit choice, not the default.
+  const resolvedDefault = useOrchestration()?.resolved_default_assignee || 'default'
   const isTriage = target === 'triage'
   const [title, setTitle] = useState('')
   const [bodyText, setBodyText] = useState('')
@@ -423,7 +583,7 @@ function NewTaskDialog({
       // create() derives status (triage flag → 'triage', else 'ready'); move to
       // the requested column when they differ, so a per-column add lands right.
       const { task, warning } = await createTask({
-        assignee: assignee || undefined,
+        assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
         body: bodyText.trim() || undefined,
         goal_mode: goalMode,
         parents: parent ? [parent] : undefined,
@@ -504,12 +664,15 @@ function NewTaskDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={NO_PARENT}>(auto / unassigned)</SelectItem>
-                {(roster?.profiles ?? []).map(profile => (
-                  <SelectItem key={profile.name} value={profile.name}>
-                    {profile.name}
-                  </SelectItem>
-                ))}
+                <SelectItem value={NO_PARENT}>{resolvedDefault} (default)</SelectItem>
+                {(roster?.profiles ?? [])
+                  .filter(profile => profile.name !== resolvedDefault)
+                  .map(profile => (
+                    <SelectItem key={profile.name} value={profile.name}>
+                      {profile.name}
+                    </SelectItem>
+                  ))}
+                <SelectItem value={PARKED}>unassigned (parked — won't run)</SelectItem>
               </SelectContent>
             </Select>
           </Field>
@@ -661,6 +824,140 @@ function FilterMenu({
   )
 }
 
+// ── selection bar ────────────────────────────────────────────────────────────
+
+/**
+ * Floating bulk-actions bar, shown while cards are ⌘-selected. Deliberately
+ * leaner than the dashboard's always-on toolbar: move / assign / archive /
+ * delete cover the real fleet chores (requeue a batch, archive a sweep of
+ * done, reassign after a profile change) via POST /tasks/bulk, which applies
+ * per-id and reports partial failures — failed cards stay selected.
+ */
+function SelectionBar({
+  columns,
+  onClear,
+  onDone,
+  selected
+}: {
+  columns: string[]
+  onClear: () => void
+  onDone: (failed: string[]) => void
+  selected: ReadonlySet<string>
+}) {
+  const qc = useQueryClient()
+  const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
+
+  const finish = (failed: Array<{ error?: string; id: string }>) => {
+    void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+
+    if (failed.length > 0) {
+      host.notify({
+        kind: 'warning',
+        message: `${failed.length} of ${selected.size} failed — ${failed[0].error ?? 'refused'}. Failed cards stay selected.`
+      })
+    }
+
+    onDone(failed.map(f => f.id))
+  }
+
+  const bulk = useMutation({
+    mutationFn: (patch: Record<string, unknown>) => bulkTasks([...selected], patch),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: data => finish(data.results.filter(r => !r.ok))
+  })
+
+  // No bulk-delete on the backend — fan out per id, same partial-failure story.
+  const bulkDelete = useMutation({
+    mutationFn: async () => {
+      const ids = [...selected]
+      const settled = await Promise.allSettled(ids.map(id => deleteTask(id)))
+
+      return ids.flatMap((id, i) => {
+        const result = settled[i]
+
+        return result.status === 'rejected' ? [{ error: errText(result.reason), id }] : []
+      })
+    },
+    onSuccess: finish
+  })
+
+  const busy = bulk.isPending || bulkDelete.isPending
+  // One menu at a time — controlled, so a click on the second trigger can
+  // never race Radix's dismiss layer into two open menus.
+  const [menu, setMenu] = useState<'assign' | 'move' | null>(null)
+
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-4 z-10 flex justify-center px-4">
+      {/* Flat overlay: stroke + elevated surface do the separating, no shadow. */}
+      <div className="pointer-events-auto flex items-center gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) py-1 pr-1 pl-3">
+        <span className="mr-1 text-xs tabular-nums text-(--ui-text-secondary)">{selected.size} selected</span>
+
+        <DropdownMenu onOpenChange={open => setMenu(open ? 'move' : null)} open={menu === 'move'}>
+          <DropdownMenuTrigger asChild>
+            <Button disabled={busy} size="xs" variant="ghost">
+              Move to
+              <Codicon name="chevron-down" size="0.7rem" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="center">
+            {columns
+              .filter(name => !isLockedTarget(name))
+              .map(name => (
+                <DropdownMenuItem key={name} onSelect={() => bulk.mutate({ status: name })}>
+                  <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
+                  {columnMeta(name).label}
+                </DropdownMenuItem>
+              ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <DropdownMenu onOpenChange={open => setMenu(open ? 'assign' : null)} open={menu === 'assign'}>
+          <DropdownMenuTrigger asChild>
+            <Button disabled={busy} size="xs" variant="ghost">
+              Assign
+              <Codicon name="chevron-down" size="0.7rem" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="center">
+            {(roster?.profiles ?? []).map(profile => (
+              <DropdownMenuItem
+                key={profile.name}
+                onSelect={() => bulk.mutate({ assignee: profile.name, reclaim_first: true })}
+              >
+                <Avatar name={profile.name} size="0.875rem" />
+                {profile.name}
+              </DropdownMenuItem>
+            ))}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => bulk.mutate({ assignee: '', reclaim_first: true })}>
+              Unassign
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <Button disabled={busy} onClick={() => bulk.mutate({ archive: true })} size="xs" variant="ghost">
+          Archive
+        </Button>
+        <Button
+          className="text-destructive"
+          disabled={busy}
+          onClick={() => bulkDelete.mutate()}
+          size="xs"
+          variant="ghost"
+        >
+          Delete
+        </Button>
+
+        <Tip label="Clear selection (Esc)">
+          <Button aria-label="Clear selection" onClick={onClear} size="icon-xs" variant="ghost">
+            <Codicon name="close" size="0.8rem" />
+          </Button>
+        </Tip>
+      </div>
+    </div>
+  )
+}
+
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export function KanbanBoardPage() {
@@ -682,16 +979,51 @@ export function KanbanBoardPage() {
   const [search, setSearch] = useState('')
   const [tenant, setTenant] = useState('')
   const [assignee, setAssignee] = useState('')
-  const [attentionOnly, setAttentionOnly] = useState(false)
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
 
-  const nudge = useMutation({
-    mutationFn: nudgeDispatcher,
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: () => {
-      host.notify({ kind: 'info', message: 'Dispatcher nudged' })
-      void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+  const toggleSelect = (id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+
+      if (!next.delete(id)) {
+        next.add(id)
+      }
+
+      return next
+    })
+  }
+
+  // Prune ids that left the board (completed elsewhere, deleted, filtered by
+  // a board switch) so the bar's count never lies about what a bulk op hits.
+  useEffect(() => {
+    if (!board) {
+      return
     }
-  })
+
+    const alive = new Set(board.columns.flatMap(col => col.tasks.map(task => task.id)))
+
+    setSelected(prev => {
+      const kept = [...prev].filter(id => alive.has(id))
+
+      return kept.length === prev.size ? prev : new Set(kept)
+    })
+  }, [board])
+
+  useEffect(() => {
+    if (selected.size === 0) {
+      return
+    }
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSelected(new Set())
+      }
+    }
+
+    window.addEventListener('keydown', onKey)
+
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selected.size])
 
   const columnNames = board?.columns.map(col => col.name) ?? []
 
@@ -711,24 +1043,12 @@ export function KanbanBoardPage() {
     const keep = (task: KanbanTask) =>
       (!q || `${task.title} ${task.body ?? ''} ${task.id}`.toLowerCase().includes(q)) &&
       (!tenant || task.tenant === tenant) &&
-      (!assignee || task.assignee === assignee) &&
-      (!attentionOnly || (task.warnings?.count ?? 0) > 0)
+      (!assignee || task.assignee === assignee)
 
     return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(keep) })) }
-  }, [board, search, tenant, assignee, attentionOnly])
+  }, [board, search, tenant, assignee])
 
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
-
-  // A completed card can still carry crash-history diagnostics (the backend
-  // scans run history, and Done is not excluded) — but "needs attention" is a
-  // to-do signal, and a done card has nothing left to do. Count active lanes only.
-  const attention = board?.columns.reduce(
-    (sum, col) =>
-      col.name === 'done' || col.name === 'archived'
-        ? sum
-        : sum + col.tasks.filter(task => (task.warnings?.count ?? 0) > 0).length,
-    0
-  )
 
   const moveMut = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
@@ -795,6 +1115,67 @@ export function KanbanBoardPage() {
 
   const errorMessage = error ? errText(error) : null
 
+  // Grab-to-scrub the lane strip (shared primitive, same as the dashboard's pan).
+  const lanesRef = useRef<HTMLDivElement>(null)
+  const { grabbing, onMouseDown } = useGrabScroll(lanesRef)
+
+  // Lane collapse: auto (empty → rail) unless the user overrode it. The map
+  // stores only deviations from auto, so it stays tiny and self-heals. On a
+  // board with no work at all, auto is disabled — a wall of rails teaches
+  // nothing, so a fresh board shows its full structure instead.
+  const laneOverrides = useValue($collapsedLanes)
+  const boardHasWork = (board?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0) > 0
+
+  // An override only lives for the lane's current empty/non-empty phase: when
+  // emptiness flips (last card dragged out, first card dropped in) the stale
+  // override is dropped and auto takes over — so a drained lane collapses even
+  // if it was manually expanded ages ago, while expanding an empty lane still
+  // sticks for as long as it stays empty.
+  const laneCounts = useRef<null | Record<string, number>>(null)
+
+  useEffect(() => {
+    if (!filtered) {
+      return
+    }
+
+    const counts = Object.fromEntries(filtered.columns.map(col => [col.name, col.tasks.length]))
+    const prev = laneCounts.current
+    laneCounts.current = counts
+
+    if (!prev) {
+      return
+    }
+
+    const overrides = { ...$collapsedLanes.get() }
+    let changed = false
+
+    for (const [name, count] of Object.entries(counts)) {
+      const before = prev[name]
+
+      if (before !== undefined && (before === 0) !== (count === 0) && name in overrides) {
+        delete overrides[name]
+        changed = true
+      }
+    }
+
+    if (changed) {
+      $collapsedLanes.set(overrides)
+    }
+  }, [filtered])
+
+  const toggleLane = (name: string, auto: boolean) => {
+    const overrides = { ...laneOverrides }
+    const next = !(overrides[name] ?? auto)
+
+    if (next === auto) {
+      delete overrides[name]
+    } else {
+      overrides[name] = next
+    }
+
+    $collapsedLanes.set(overrides)
+  }
+
   return (
     <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
       {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
@@ -819,34 +1200,7 @@ export function KanbanBoardPage() {
           />
         )}
         <SearchField aria-label="Filter cards" onChange={setSearch} placeholder="Filter cards…" value={search} />
-        {Boolean(attention) && (
-          <Tip label={attentionOnly ? 'Show all tasks' : 'Show only tasks with active diagnostics'}>
-            <button
-              className={cn(
-                'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.6875rem] font-medium text-destructive transition-colors',
-                'bg-[color-mix(in_srgb,var(--destructive)_8%,transparent)] hover:bg-[color-mix(in_srgb,var(--destructive)_14%,transparent)]',
-                attentionOnly && 'bg-[color-mix(in_srgb,var(--destructive)_16%,transparent)]'
-              )}
-              onClick={() => setAttentionOnly(!attentionOnly)}
-              type="button"
-            >
-              <Codicon name="warning" size="0.7rem" />
-              {attention} need{attention === 1 ? 's' : ''} attention
-            </button>
-          </Tip>
-        )}
         <div className="ml-auto flex items-center gap-1">
-          <Tip label="Run a dispatch tick now instead of waiting for the next one">
-            <Button
-              aria-label="Nudge dispatcher"
-              disabled={nudge.isPending}
-              onClick={() => nudge.mutate()}
-              size="icon-xs"
-              variant="ghost"
-            >
-              <Codicon name="rocket" size="0.85rem" />
-            </Button>
-          </Tip>
           <Tip label="Orchestration settings">
             <Button
               aria-label="Orchestration settings"
@@ -882,7 +1236,7 @@ export function KanbanBoardPage() {
           <div className="flex flex-col items-center gap-2">
             <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
             <p className="text-xs text-(--ui-text-tertiary)">
-              {search || tenant || assignee || attentionOnly ? 'No tasks match the filters' : 'No tasks on this board'}
+              {search || tenant || assignee ? 'No tasks match the filters' : 'No tasks on this board'}
             </p>
             <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
               <Codicon name="add" size="0.75rem" />
@@ -891,20 +1245,41 @@ export function KanbanBoardPage() {
           </div>
         </div>
       ) : (
-        <div className="flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3">
-          {filtered.columns.map(col => (
-            <Column
-              column={col}
-              columns={columnNames}
-              key={col.name}
-              onAdd={setAddStatus}
-              onDelete={id => deleteMut.mutate(id)}
-              onDropTask={onMove}
-              onMove={onMove}
-              onOpen={setOpenId}
-            />
-          ))}
+        <div
+          className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+          onMouseDown={onMouseDown}
+          ref={lanesRef}
+        >
+          {filtered.columns.map(col => {
+            const auto = boardHasWork && col.tasks.length === 0
+
+            return (
+              <Column
+                collapsed={laneOverrides[col.name] ?? auto}
+                column={col}
+                columns={columnNames}
+                key={col.name}
+                onAdd={setAddStatus}
+                onDelete={id => deleteMut.mutate(id)}
+                onDropTask={onMove}
+                onMove={onMove}
+                onOpen={setOpenId}
+                onToggle={() => toggleLane(col.name, auto)}
+                onToggleSelect={toggleSelect}
+                selected={selected}
+              />
+            )
+          })}
         </div>
+      )}
+
+      {selected.size > 0 && (
+        <SelectionBar
+          columns={columnNames}
+          onClear={() => setSelected(new Set())}
+          onDone={failed => setSelected(new Set(failed))}
+          selected={selected}
+        />
       )}
 
       <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />

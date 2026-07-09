@@ -10,11 +10,24 @@ import {
   DropdownMenuTrigger,
   profileColor,
   profileColorSoft,
-  relativeTime
+  relativeTime,
+  useQuery
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useLayoutEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import { columnMeta } from './types'
+import { fetchOrchestration, ORCHESTRATION_KEY } from './api'
+import { columnMeta, type KanbanTask } from './types'
+
+/** Orchestration knobs (cached app-wide; the settings panel invalidates). */
+export function useOrchestration() {
+  return useQuery({ queryKey: ORCHESTRATION_KEY, queryFn: fetchOrchestration, staleTime: 60_000 }).data
+}
+
+/** The dispatcher's configured fallback for unassigned ready cards
+ *  (`kanban.default_assignee`) — '' when unset, i.e. unassigned never runs. */
+export function useDefaultAssignee(): string {
+  return useOrchestration()?.default_assignee.trim() ?? ''
+}
 
 // System-owned drop targets — you can drag a card OUT of these, never INTO
 // them, so lanes/menus must not offer them as targets. `running`/`review` are
@@ -61,6 +74,77 @@ export function duration(start?: null | number, end?: null | number): null | str
   const { unit, value } = coarseElapsed((end - start) * 1000)
 
   return `${value}${ELAPSED_SUFFIX[unit]}`
+}
+
+// ── liveness ─────────────────────────────────────────────────────────────────
+
+/** Live elapsed label ("34s", "2m") that keeps ticking while mounted. */
+function useTicking(start?: null | number): null | string {
+  const [, force] = useState(0)
+
+  useEffect(() => {
+    if (!start) {
+      return
+    }
+
+    const id = window.setInterval(() => force(n => n + 1), 5_000)
+
+    return () => window.clearInterval(id)
+  }, [start])
+
+  if (!start) {
+    return null
+  }
+
+  const { unit, value } = coarseElapsed(Math.max(0, Date.now() - start * 1000))
+
+  return `${value}${ELAPSED_SUFFIX[unit]}`
+}
+
+export type ArcState = 'queued' | 'running' | 'stale'
+
+/**
+ * The card's machine-activity state. The board looked dead between "I made a
+ * card" and "it's suddenly running" — this narrates the in-between. Only the
+ * working states animate the border arc (see kanban.css): running = brisk
+ * sweep, no-heartbeat = amber crawl. `queued` (triage / assigned-ready /
+ * review) renders as the footer's named-agent chip — motion means work.
+ */
+export function arcState(task: KanbanTask, fallbackAssignee: string): ArcState | null {
+  if (task.status === 'running') {
+    // No heartbeat for 2+ min = the worker may have died; the dispatcher will
+    // reclaim it, but be honest instead of sweeping green forever.
+    const stale = task.last_heartbeat_at ? Date.now() / 1000 - task.last_heartbeat_at > 120 : false
+
+    return stale ? 'stale' : 'running'
+  }
+
+  const queued =
+    task.status === 'triage' ||
+    task.status === 'review' ||
+    (task.status === 'ready' && Boolean(task.assignee || fallbackAssignee))
+
+  return queued ? 'queued' : null
+}
+
+export const ARC_TITLES = {
+  running: 'An agent is working on this now.',
+  stale: 'Claimed, but no worker heartbeat for 2+ minutes — the dispatcher will reclaim it.'
+} as const
+
+/** Ticking "working · 34s" line for running cards (elapsed since claim). */
+export function RunClock({ task }: { task: KanbanTask }) {
+  const elapsed = useTicking(task.started_at)
+
+  if (!elapsed) {
+    return null
+  }
+
+  return (
+    <span className="shrink-0 font-medium" style={{ color: columnMeta('running').tone }}>
+      working · {elapsed}
+    </span>
+  )
 }
 
 function initials(name: string): string {

@@ -36,9 +36,14 @@ export const $introDismissed = atom<boolean>(false)
  *  profile"). Persisted. */
 export const $lanesByProfile = atom<boolean>(false)
 
+/** Per-lane collapse OVERRIDES (true=collapsed, false=expanded). Absence means
+ *  auto: empty lanes collapse to a rail, occupied lanes expand. Persisted. */
+export const $collapsedLanes = atom<Record<string, boolean>>({})
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
+const COLLAPSED_KEY = 'collapsedLanes'
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
@@ -51,6 +56,8 @@ function onEventsFrame(slug: string, data: unknown): void {
   }
 
   void queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
+  // Any event can change a board's card count — keep the switcher badge honest.
+  void queryClient.invalidateQueries({ queryKey: BOARDS_KEY })
 
   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
     void queryClient.invalidateQueries({ queryKey: taskKey(slug, taskId!) })
@@ -67,6 +74,8 @@ export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): void {
   $introDismissed.listen(dismissed => storage.set(INTRO_KEY, dismissed))
   $lanesByProfile.set(storage.get(LANES_KEY, false))
   $lanesByProfile.listen(on => storage.set(LANES_KEY, on))
+  $collapsedLanes.set(storage.get(COLLAPSED_KEY, {}))
+  $collapsedLanes.listen(map => storage.set(COLLAPSED_KEY, map))
 
   let close: (() => void) | null = null
 
@@ -124,21 +133,61 @@ export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestrat
 
 // ── writes ────────────────────────────────────────────────────────────────────
 
+// Every board edit nudges the dispatcher (debounced, fire-and-forget) so the
+// change takes effect NOW instead of on the next 60s tick — create a ready
+// task and the worker spawns immediately, no manual "nudge" ritual. The tick
+// is lock-guarded and ~1ms when there's nothing to do, so over-nudging is
+// free; failures are non-events (the periodic tick still exists).
+let nudgeTimer: null | ReturnType<typeof setTimeout> = null
+
+function autoNudge(): void {
+  if (nudgeTimer != null) {
+    clearTimeout(nudgeTimer)
+  }
+
+  nudgeTimer = setTimeout(() => {
+    nudgeTimer = null
+    nudgeDispatcher().catch(() => undefined)
+  }, 400)
+}
+
+/** Resolve the write, then kick the dispatcher. Rejections pass through. */
+function nudged<T>(write: Promise<T>): Promise<T> {
+  return write.then(value => {
+    autoNudge()
+
+    return value
+  })
+}
+
 export const patchTask = (id: string, patch: Record<string, unknown>) =>
-  call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch })
+  nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
 
 export const createTask = (body: Record<string, unknown>) =>
-  call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body })
+  nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
 
-export const deleteTask = (id: string) => call(withBoard(`/tasks/${id}`), { method: 'DELETE' })
+// Deleting can unblock dependants (a gone parent no longer gates), so it
+// nudges too.
+export const deleteTask = (id: string) => nudged(call(withBoard(`/tasks/${id}`), { method: 'DELETE' }))
+
+/** One patch, many ids — independent per-id application; returns per-id
+ *  outcomes so the UI can toast partial failures. */
+export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
+  nudged(
+    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(withBoard('/tasks/bulk'), {
+      method: 'POST',
+      body: { ids, ...patch }
+    })
+  )
 
 export const addComment = (id: string, body: string) =>
   call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
 
 export const reassignTask = (id: string, profile: string) =>
-  call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } })
+  nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
 
-export const reclaimTask = (id: string) => call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} })
+export const reclaimTask = (id: string) =>
+  nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
 
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })

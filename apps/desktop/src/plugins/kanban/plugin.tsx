@@ -9,6 +9,8 @@
  * Settings ▸ Plugins and registers nothing until the user flips the switch.
  */
 
+import './kanban.css'
+
 import {
   cn,
   Codicon,

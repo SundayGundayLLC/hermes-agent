@@ -19,6 +19,10 @@ export interface KanbanTask {
   progress?: null | { done: number; total: number }
   /** Compact diagnostics rollup — present only when a card has warnings. */
   warnings?: null | { count: number; highest_severity?: null | string }
+  /** Worker liveness (present on running cards) — drives the arc + run clock. */
+  started_at?: null | number
+  worker_pid?: null | number
+  last_heartbeat_at?: null | number
 }
 
 export interface KanbanColumn {
