@@ -9,7 +9,7 @@
  * desktop's selection never flips the server-wide current-board pointer.
  */
 
-import { atom, type PluginRestOptions, type PluginStorage } from '@hermes/plugin-sdk'
+import { atom, type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
 
 import type {
   BoardsResponse,
@@ -22,6 +22,7 @@ import type {
 } from './types'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
+type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 
 let rest: null | Rest = null
 
@@ -31,16 +32,51 @@ export const $boardSlug = atom<string>('')
 /** Whether the "how this board works" intro was dismissed. Persisted. */
 export const $introDismissed = atom<boolean>(false)
 
+/** Sub-group the Running lane by assignee (the dashboard's "lanes by
+ *  profile"). Persisted. */
+export const $lanesByProfile = atom<boolean>(false)
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
+const LANES_KEY = 'lanesByProfile'
 
-/** Bind the plugin's REST door + storage once, at register time. */
-export function bindApi(r: Rest, storage: PluginStorage): void {
+/** One live `task_events` frame → precise cache invalidation: the board, plus
+ *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
+ *  fallback — the socket just makes the board feel instant. */
+function onEventsFrame(slug: string, data: unknown): void {
+  const events = (data as { events?: Array<{ task_id?: string }> })?.events
+
+  if (!events?.length) {
+    return
+  }
+
+  void queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
+
+  for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
+    void queryClient.invalidateQueries({ queryKey: taskKey(slug, taskId!) })
+  }
+}
+
+/** Bind the plugin's doors once, at register time. The events socket is pinned
+ *  to a board at handshake, so a board switch closes + reopens it. */
+export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): void {
   rest = r
   $boardSlug.set(storage.get(BOARD_SLUG_KEY, ''))
   $boardSlug.listen(slug => storage.set(BOARD_SLUG_KEY, slug))
   $introDismissed.set(storage.get(INTRO_KEY, false))
   $introDismissed.listen(dismissed => storage.set(INTRO_KEY, dismissed))
+  $lanesByProfile.set(storage.get(LANES_KEY, false))
+  $lanesByProfile.listen(on => storage.set(LANES_KEY, on))
+
+  let close: (() => void) | null = null
+
+  const open = (slug: string) => {
+    close?.()
+    close = socket(slug ? `/events?board=${encodeURIComponent(slug)}` : '/events', data => onEventsFrame(slug, data))
+  }
+
+  open($boardSlug.get())
+  $boardSlug.listen(open)
 }
 
 function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
@@ -101,6 +137,11 @@ export const addComment = (id: string, body: string) =>
 
 export const reassignTask = (id: string, profile: string) =>
   call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } })
+
+export const reclaimTask = (id: string) => call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} })
+
+export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
+  call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
 export const createBoard = (slug: string, name: string) =>
   call<{ board: { slug: string } }>('/boards', { method: 'POST', body: { slug, name } })

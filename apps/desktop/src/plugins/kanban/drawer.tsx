@@ -25,7 +25,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import {
   $boardSlug,
@@ -38,9 +38,17 @@ import {
   patchTask,
   PROFILES_KEY,
   reassignTask,
-  taskKey
+  reclaimTask,
+  taskKey,
+  uploadAttachment
 } from './api'
-import { type Diagnostic, type KanbanTaskDetail, SEVERITY_TONE } from './types'
+import {
+  type Diagnostic,
+  type DiagnosticAction,
+  type KanbanAttachment,
+  type KanbanTaskDetail,
+  SEVERITY_TONE
+} from './types'
 import {
   ago,
   Avatar,
@@ -64,13 +72,24 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
   )
 }
 
-/** The dashboard's diagnostics panel: severity-toned, plain-English. Recovery
- *  lives where Jira puts it — the assignee control in the meta table. */
-function Diagnostics({ items }: { items: Diagnostic[] }) {
+/** The dashboard's diagnostics panel: severity-toned, plain-English, with the
+ *  backend's structured recovery actions as buttons. `reassign` is skipped —
+ *  the Assignee control in the meta table IS that action, inline. */
+function Diagnostics({ items, onReclaim }: { items: Diagnostic[]; onReclaim: () => void }) {
+  const act = (action: DiagnosticAction) => {
+    if (action.kind === 'reclaim') {
+      onReclaim()
+    } else if (action.kind === 'cli_hint') {
+      void navigator.clipboard.writeText(String(action.payload?.command ?? action.label))
+      host.notify({ kind: 'info', message: 'Command copied' })
+    }
+  }
+
   return (
     <div className="flex flex-col gap-2">
       {items.map(diag => {
         const tone = SEVERITY_TONE[diag.severity]
+        const actions = diag.actions.filter(action => action.kind === 'reclaim' || action.kind === 'cli_hint')
 
         return (
           <div
@@ -88,6 +107,21 @@ function Diagnostics({ items }: { items: Diagnostic[] }) {
             <p className="whitespace-pre-wrap text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
               {diag.detail}
             </p>
+            {actions.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {actions.map(action => (
+                  <Button
+                    key={`${action.kind}-${action.label}`}
+                    onClick={() => act(action)}
+                    size="xs"
+                    variant={action.suggested ? 'secondary' : 'outline'}
+                  >
+                    {action.kind === 'cli_hint' && <Codicon name="copy" size="0.7rem" />}
+                    {action.label}
+                  </Button>
+                ))}
+              </div>
+            )}
           </div>
         )
       })}
@@ -235,6 +269,64 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
 // administrative note into that slot; hide those (Runs still shows them).
 const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\/direct\)$/.test(summary)
 
+function AttachmentsSection({
+  attachments,
+  onUpload,
+  pending
+}: {
+  attachments: KanbanAttachment[]
+  onUpload: (file: File) => void
+  pending: boolean
+}) {
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  return (
+    <Section
+      action={
+        <>
+          <input
+            hidden
+            onChange={event => {
+              const file = event.target.files?.[0]
+
+              if (file) {
+                onUpload(file)
+              }
+
+              event.target.value = ''
+            }}
+            ref={fileRef}
+            type="file"
+          />
+          <Button
+            aria-label="Upload attachment"
+            disabled={pending}
+            onClick={() => fileRef.current?.click()}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name={pending ? 'sync' : 'cloud-upload'} size="0.8rem" spinning={pending} />
+          </Button>
+        </>
+      }
+      label={`Attachments · ${attachments.length}`}
+    >
+      {attachments.length > 0 ? (
+        <ul className="flex flex-col gap-1">
+          {attachments.map(attachment => (
+            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
+              <Codicon name="file" size="0.75rem" />
+              {attachment.filename}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[0.75rem] text-(--ui-text-quaternary)">No attachments yet.</p>
+      )}
+    </Section>
+  )
+}
+
 export function TaskDrawer({
   columns,
   id,
@@ -323,6 +415,13 @@ export function TaskDrawer({
 
   const commentMut = useMutation({
     mutationFn: (body: string) => addComment(id!, body),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: invalidate
+  })
+
+  const uploadMut = useMutation({
+    mutationFn: async (file: File) =>
+      uploadAttachment(id!, { bytes: await file.arrayBuffer(), contentType: file.type || undefined, filename: file.name }),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -452,7 +551,10 @@ export function TaskDrawer({
 
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={`Diagnostics · ${task.diagnostics.length}`}>
-                <Diagnostics items={task.diagnostics} />
+                <Diagnostics
+                  items={task.diagnostics}
+                  onReclaim={() => void mutate(() => reclaimTask(task.id))()}
+                />
               </Section>
             )}
 
@@ -580,21 +682,11 @@ export function TaskDrawer({
               </Section>
             )}
 
-            {detail.attachments.length > 0 && (
-              <Section label={`Attachments · ${detail.attachments.length}`}>
-                <ul className="flex flex-col gap-1">
-                  {detail.attachments.map(attachment => (
-                    <li
-                      className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)"
-                      key={attachment.id}
-                    >
-                      <Codicon name="file" size="0.75rem" />
-                      {attachment.filename}
-                    </li>
-                  ))}
-                </ul>
-              </Section>
-            )}
+            <AttachmentsSection
+              attachments={detail.attachments}
+              onUpload={file => uploadMut.mutate(file)}
+              pending={uploadMut.isPending}
+            />
           </div>
         )}
       </div>

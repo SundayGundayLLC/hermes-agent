@@ -51,6 +51,7 @@ import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import {
   $boardSlug,
   $introDismissed,
+  $lanesByProfile,
   boardKey,
   createTask,
   deleteTask,
@@ -248,6 +249,24 @@ function Column({
   const [over, setOver] = useState(false)
   const meta = columnMeta(column.name)
   const locked = isLockedTarget(column.name)
+  const byProfile = useValue($lanesByProfile)
+
+  // The dashboard's "lanes by profile": sub-group Running by assignee so a
+  // fleet's in-flight work reads per-worker. Null = flat (off, or trivial).
+  const lanes = useMemo(() => {
+    if (!byProfile || column.name !== 'running' || column.tasks.length === 0) {
+      return null
+    }
+
+    const groups = new Map<string, KanbanTask[]>()
+
+    for (const task of column.tasks) {
+      const key = task.assignee || UNASSIGNED_LANE
+      groups.set(key, [...(groups.get(key) ?? []), task])
+    }
+
+    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))
+  }, [byProfile, column])
 
   return (
     <div
@@ -291,9 +310,24 @@ function Column({
         <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{column.tasks.length}</span>
       </header>
       <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
-        {column.tasks.map(task => (
-          <Card columns={columns} key={task.id} onDelete={onDelete} onMove={onMove} onOpen={onOpen} task={task} />
-        ))}
+        {lanes ? (
+          lanes.map(([assignee, tasks]) => (
+            <div className="flex flex-col gap-2" key={assignee}>
+              <div className="flex items-center gap-1.5 px-1 pt-1 text-[0.625rem] text-(--ui-text-quaternary)">
+                {assignee !== UNASSIGNED_LANE && <Avatar name={assignee} size="0.875rem" />}
+                {assignee}
+                <span className="tabular-nums">{tasks.length}</span>
+              </div>
+              {tasks.map(task => (
+                <Card columns={columns} key={task.id} onDelete={onDelete} onMove={onMove} onOpen={onOpen} task={task} />
+              ))}
+            </div>
+          ))
+        ) : (
+          column.tasks.map(task => (
+            <Card columns={columns} key={task.id} onDelete={onDelete} onMove={onMove} onOpen={onOpen} task={task} />
+          ))
+        )}
         {/* Jira-style lane add — dashed, faded in on lane hover. Opacity (not
             display) so it always holds its slot and never thrashes layout.
             Locked lanes get none: you can't create into a system state. */}
@@ -556,6 +590,8 @@ function Intro() {
   )
 }
 
+const UNASSIGNED_LANE = 'unassigned'
+
 // ── filter kebab ─────────────────────────────────────────────────────────────
 
 function FilterMenu({
@@ -576,6 +612,7 @@ function FilterMenu({
   tenant: string
 }) {
   const active = Boolean(assignee || tenant || archived)
+  const lanesByProfile = useValue($lanesByProfile)
 
   const check = (on: boolean) => (on ? <Codicon className="ml-auto" name="check" size="0.8rem" /> : null)
 
@@ -615,6 +652,9 @@ function FilterMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => onArchived(!archived)}>
           Show archived{check(archived)}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => $lanesByProfile.set(!lanesByProfile)}>
+          Group Running by profile{check(lanesByProfile)}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
