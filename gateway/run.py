@@ -11570,6 +11570,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _agent_message = message_text
             _agent_session_id = _run_start_session_id
             _root_history_offset = len(history)
+            # A bounded continuation is still the same inbound event.  Keep
+            # its reply anchor and source identity stable across every attempt.
+            _pre_delivery_event_message_id = self._reply_anchor_for_event(event)
+            _pre_delivery_source_message_id = str(
+                getattr(event, "message_id", None) or ""
+            )
             while True:
                 agent_result = await self._run_agent(
                     message=_agent_message,
@@ -11579,11 +11585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=_agent_session_id,
                     session_key=session_key,
                     run_generation=run_generation,
-                    event_message_id=(
-                        self._reply_anchor_for_event(event)
-                        if _pre_delivery_attempt == 0
-                        else None
-                    ),
+                    event_message_id=_pre_delivery_event_message_id,
                     channel_prompt=event.channel_prompt,
                     moa_config=getattr(event, "_moa_config", None),
                     persist_user_message=(
@@ -11595,6 +11597,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pre_delivery_attempt=_pre_delivery_attempt,
                     pre_delivery_prior_telemetry=_pre_delivery_prior_telemetry,
                     pre_delivery_empty_count=_pre_delivery_empty_count,
+                    pre_delivery_original_message=message_text,
+                    pre_delivery_source_message_id=(
+                        _pre_delivery_source_message_id
+                    ),
                 )
                 if not agent_result.get("pre_delivery_continue"):
                     break
@@ -16956,6 +16962,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pre_delivery_attempt: int = 0,
         pre_delivery_prior_telemetry: Optional[Dict[str, Any]] = None,
         pre_delivery_empty_count: int = 0,
+        pre_delivery_original_message: Optional[str] = None,
+        pre_delivery_source_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -16977,6 +16985,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pre_delivery_attempt=pre_delivery_attempt,
                 pre_delivery_prior_telemetry=pre_delivery_prior_telemetry,
                 pre_delivery_empty_count=pre_delivery_empty_count,
+                pre_delivery_original_message=pre_delivery_original_message,
+                pre_delivery_source_message_id=pre_delivery_source_message_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -16991,6 +17001,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pre_delivery_attempt=pre_delivery_attempt,
                 pre_delivery_prior_telemetry=pre_delivery_prior_telemetry,
                 pre_delivery_empty_count=pre_delivery_empty_count,
+                pre_delivery_original_message=pre_delivery_original_message,
+                pre_delivery_source_message_id=pre_delivery_source_message_id,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -17026,6 +17038,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pre_delivery_attempt: int = 0,
         pre_delivery_prior_telemetry: Optional[Dict[str, Any]] = None,
         pre_delivery_empty_count: int = 0,
+        pre_delivery_original_message: Optional[str] = None,
+        pre_delivery_source_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17040,9 +17054,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
-        _pre_delivery_enabled = self.hooks.has_exact_handlers(
-            "agent:pre_delivery"
+        # HookRegistry gained a strict authority-health contract.  Retain the
+        # legacy duck-typed ``has_exact_handlers`` seam for third-party/test
+        # registries that implement the older hook interface.
+        _hooks = self.hooks
+        _authority_expected_fn = getattr(
+            type(_hooks), "authority_expected", None
         )
+        if callable(_authority_expected_fn):
+            _pre_delivery_enabled = _authority_expected_fn(
+                _hooks, "agent:pre_delivery"
+            )
+        else:
+            _legacy_exact_fn = getattr(
+                type(_hooks), "has_exact_handlers", None
+            )
+            _pre_delivery_enabled = (
+                _legacy_exact_fn(_hooks, "agent:pre_delivery")
+                if callable(_legacy_exact_fn)
+                else False
+            )
+        _assert_authority_healthy_fn = getattr(
+            type(_hooks), "assert_authority_healthy", None
+        )
+        if _pre_delivery_enabled and callable(_assert_authority_healthy_fn):
+            _assert_authority_healthy_fn(_hooks, "agent:pre_delivery")
         if self._get_proxy_url() and _pre_delivery_enabled:
             from agent.pre_delivery import DEGRADED_RESPONSE
             return {
@@ -17946,6 +17982,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.platform,
                 str(context.get("candidate_final") or ""),
             )
+            context["original_message"] = (
+                pre_delivery_original_message
+                if pre_delivery_original_message is not None
+                else context.get("original_message")
+            )
             context.update(merged_telemetry)
             context.update({
                 "platform": source.platform.value if source.platform else "",
@@ -17953,12 +17994,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "chat_id": source.chat_id or "",
                 "thread_id": str(getattr(source, "thread_id", None) or ""),
                 "chat_type": getattr(source, "chat_type", "") or "",
-                "message_id": str(event_message_id or ""),
+                "message_id": str(pre_delivery_source_message_id or ""),
                 "source_id": ":".join(filter(None, (
                     source.platform.value if source.platform else "",
                     str(source.chat_id or ""),
                     str(getattr(source, "thread_id", None) or ""),
-                    str(event_message_id or ""),
+                    str(pre_delivery_source_message_id or ""),
                 ))),
                 "session_key": session_key or "",
                 "run_generation": run_generation,
@@ -17971,14 +18012,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             })
 
             async def _evaluate() -> dict:
-                results = await _hooks_ref.emit_collect(
-                    "agent:pre_delivery",
-                    context,
-                    raise_exceptions=True,
-                    exact_only=True,
-                    run_sync_in_executor=True,
+                _emit_authority_fn = getattr(
+                    type(_hooks_ref), "emit_authority", None
                 )
-                decision = reduce_decisions(results, allow_empty=True)
+                if callable(_emit_authority_fn):
+                    results = await _emit_authority_fn(
+                        _hooks_ref,
+                        "agent:pre_delivery",
+                        context,
+                        run_sync_in_executor=True,
+                    )
+                else:
+                    results = await _hooks_ref.emit_collect(
+                        "agent:pre_delivery",
+                        context,
+                        raise_exceptions=True,
+                        exact_only=True,
+                        run_sync_in_executor=True,
+                    )
+                decision = reduce_decisions(results)
                 return enforce_continuation_budget(
                     decision, pre_delivery_attempt
                 )
