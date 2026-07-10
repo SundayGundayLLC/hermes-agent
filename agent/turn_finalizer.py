@@ -287,7 +287,7 @@ def finalize_turn(
                 "role": "assistant",
                 "content": REJECTED_CANDIDATE_PLACEHOLDER,
                 "_pre_delivery_rejected": True,
-                "pre_delivery_status": "rejected_nonterminal",
+                "_pre_delivery_status": "rejected_nonterminal",
             }
             if messages and messages[-1].get("role") == "assistant":
                 # Rebuild from an allowlist instead of deleting known fields.

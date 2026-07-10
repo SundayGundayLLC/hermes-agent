@@ -370,9 +370,21 @@ def test_rejected_placeholder_drops_all_provider_replay_payloads(monkeypatch):
         "role": "assistant",
         "content": REJECTED_CANDIDATE_PLACEHOLDER,
         "_pre_delivery_rejected": True,
-        "pre_delivery_status": "rejected_nonterminal",
+        "_pre_delivery_status": "rejected_nonterminal",
     }
     assert agent.persisted_messages[-1] == result["messages"][-1]
+
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    wire_messages = ChatCompletionsTransport().convert_messages(
+        result["messages"], model=agent.model
+    )
+    assert wire_messages[-1] == {
+        "role": "assistant",
+        "content": REJECTED_CANDIDATE_PLACEHOLDER,
+    }
+    assert "_pre_delivery_rejected" in result["messages"][-1]
+    assert "_pre_delivery_status" in result["messages"][-1]
 
 
 def test_unconfirmed_placeholder_persistence_fails_closed(monkeypatch):
