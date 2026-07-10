@@ -17057,27 +17057,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # HookRegistry gained a strict authority-health contract.  Retain the
         # legacy duck-typed ``has_exact_handlers`` seam for third-party/test
         # registries that implement the older hook interface.
+        _hooks = self.hooks
         _authority_expected_fn = getattr(
-            type(self.hooks), "authority_expected", None
+            type(_hooks), "authority_expected", None
         )
         if callable(_authority_expected_fn):
             _pre_delivery_enabled = _authority_expected_fn(
-                self.hooks, "agent:pre_delivery"
+                _hooks, "agent:pre_delivery"
             )
         else:
             _legacy_exact_fn = getattr(
-                self.hooks, "has_exact_handlers", None
+                type(_hooks), "has_exact_handlers", None
             )
             _pre_delivery_enabled = (
-                _legacy_exact_fn("agent:pre_delivery")
+                _legacy_exact_fn(_hooks, "agent:pre_delivery")
                 if callable(_legacy_exact_fn)
                 else False
             )
         _assert_authority_healthy_fn = getattr(
-            type(self.hooks), "assert_authority_healthy", None
+            type(_hooks), "assert_authority_healthy", None
         )
         if _pre_delivery_enabled and callable(_assert_authority_healthy_fn):
-            _assert_authority_healthy_fn(self.hooks, "agent:pre_delivery")
+            _assert_authority_healthy_fn(_hooks, "agent:pre_delivery")
         if self._get_proxy_url() and _pre_delivery_enabled:
             from agent.pre_delivery import DEGRADED_RESPONSE
             return {
