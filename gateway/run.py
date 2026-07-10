@@ -11573,6 +11573,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # A bounded continuation is still the same inbound event.  Keep
             # its reply anchor and source identity stable across every attempt.
             _pre_delivery_event_message_id = self._reply_anchor_for_event(event)
+            _pre_delivery_source_message_id = str(
+                getattr(event, "message_id", None) or ""
+            )
             while True:
                 agent_result = await self._run_agent(
                     message=_agent_message,
@@ -11595,6 +11598,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pre_delivery_prior_telemetry=_pre_delivery_prior_telemetry,
                     pre_delivery_empty_count=_pre_delivery_empty_count,
                     pre_delivery_original_message=message_text,
+                    pre_delivery_source_message_id=(
+                        _pre_delivery_source_message_id
+                    ),
                 )
                 if not agent_result.get("pre_delivery_continue"):
                     break
@@ -16957,6 +16963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pre_delivery_prior_telemetry: Optional[Dict[str, Any]] = None,
         pre_delivery_empty_count: int = 0,
         pre_delivery_original_message: Optional[str] = None,
+        pre_delivery_source_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -16979,6 +16986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pre_delivery_prior_telemetry=pre_delivery_prior_telemetry,
                 pre_delivery_empty_count=pre_delivery_empty_count,
                 pre_delivery_original_message=pre_delivery_original_message,
+                pre_delivery_source_message_id=pre_delivery_source_message_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -16994,6 +17002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pre_delivery_prior_telemetry=pre_delivery_prior_telemetry,
                 pre_delivery_empty_count=pre_delivery_empty_count,
                 pre_delivery_original_message=pre_delivery_original_message,
+                pre_delivery_source_message_id=pre_delivery_source_message_id,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -17030,6 +17039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pre_delivery_prior_telemetry: Optional[Dict[str, Any]] = None,
         pre_delivery_empty_count: int = 0,
         pre_delivery_original_message: Optional[str] = None,
+        pre_delivery_source_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17983,12 +17993,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "chat_id": source.chat_id or "",
                 "thread_id": str(getattr(source, "thread_id", None) or ""),
                 "chat_type": getattr(source, "chat_type", "") or "",
-                "message_id": str(event_message_id or ""),
+                "message_id": str(pre_delivery_source_message_id or ""),
                 "source_id": ":".join(filter(None, (
                     source.platform.value if source.platform else "",
                     str(source.chat_id or ""),
                     str(getattr(source, "thread_id", None) or ""),
-                    str(event_message_id or ""),
+                    str(pre_delivery_source_message_id or ""),
                 ))),
                 "session_key": session_key or "",
                 "run_generation": run_generation,

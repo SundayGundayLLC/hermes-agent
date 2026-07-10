@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from agent.pre_delivery import REJECTED_CANDIDATE_PLACEHOLDER
+from agent.pre_delivery import DEGRADED_RESPONSE, REJECTED_CANDIDATE_PLACEHOLDER
 from agent.turn_finalizer import finalize_turn
 from gateway.config import GatewayConfig, Platform
 from gateway.hooks import HookRegistry
@@ -67,9 +67,9 @@ class _FinalizerAgent:
     ):
         history = list(conversation_history or [])
         candidate = (
-            "unsafe first completion"
-            if message == "perform the original task"
-            else "safe completion"
+            "safe completion"
+            if "recover safely" in str(message)
+            else "unsafe first completion"
         )
         messages = history + [
             {"role": "user", "content": message},
@@ -161,7 +161,9 @@ def _runner(monkeypatch, tmp_path):
     runner._recover_telegram_topic_thread_id = lambda _source: None
     runner._cache_session_source = lambda _key, _source: None
     runner._is_session_run_current = lambda _key, _gen: True
-    runner._reply_anchor_for_event = lambda event: event.message_id
+    # Telegram group/forum reply anchoring is optional.  The immutable source
+    # identity must come from the raw event even when transport has no anchor.
+    runner._reply_anchor_for_event = lambda _event: None
     runner._get_guild_id = lambda _event: None
     runner._should_send_voice_reply = lambda *_a, **_kw: False
     runner._agent_cache = None
@@ -248,3 +250,102 @@ async def test_real_authority_registry_and_gateway_continuation_are_atomic(
     ]
     assert "unsafe first completion" not in repr(appended)
     assert any(message.get("content") == "safe completion" for message in appended)
+
+
+@pytest.mark.asyncio
+async def test_explicit_off_mode_bypasses_installed_sdgd_authority(
+    monkeypatch, tmp_path
+):
+    """The rollback lever preserves the legacy candidate without dispatch."""
+    hooks_dir = tmp_path / "hooks"
+    hook_dir = hooks_dir / "sdgd-pre-delivery"
+    hook_dir.mkdir(parents=True)
+    marker = tmp_path / "authority-called.txt"
+    (hook_dir / "HOOK.yaml").write_text(
+        "name: sdgd-pre-delivery\nevents: [agent:pre_delivery]\n"
+    )
+    (hook_dir / "handler.py").write_text(
+        "from pathlib import Path\n"
+        "def handle(event_type, context):\n"
+        f"    Path({str(marker)!r}).write_text('called')\n"
+        "    return {'decision': 'block', 'response': 'must not run'}\n"
+    )
+    monkeypatch.setenv("SDGD_HERMES_PRE_DELIVERY_GATE_MODE", "off")
+    monkeypatch.setattr("gateway.hooks.HOOKS_DIR", hooks_dir)
+
+    runner = _runner(monkeypatch, tmp_path)
+    runner.hooks = HookRegistry()
+    runner.hooks.discover_and_load()
+    _FinalizerAgent.persist_log = []
+    monkeypatch.setattr("run_agent.AIAgent", _FinalizerAgent)
+    event = _event()
+
+    response = await runner._handle_message_with_agent(
+        event,
+        event.source,
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert runner.hooks.authority_expected("agent:pre_delivery") is False
+    assert response == "unsafe first completion"
+    assert marker.exists() is False
+    assert "must not run" not in repr(_FinalizerAgent.persist_log)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_body", "timeout"),
+    [
+        ("    return None\n", None),
+        ("    raise RuntimeError('validator crashed')\n", None),
+        (
+            "    import time\n"
+            "    time.sleep(0.2)\n"
+            "    return {'decision': 'allow'}\n",
+            0.01,
+        ),
+    ],
+)
+async def test_authority_dispatch_failure_suppresses_output(
+    monkeypatch, tmp_path, handler_body, timeout
+):
+    """None, exceptions, and timeouts cannot release candidate text."""
+    hooks_dir = tmp_path / "hooks"
+    hook_dir = hooks_dir / "failure-gate"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "HOOK.yaml").write_text(
+        "name: failure-gate\nevents: [agent:pre_delivery]\n"
+    )
+    (hook_dir / "handler.py").write_text(
+        "def handle(event_type, context):\n" + handler_body
+    )
+    monkeypatch.setattr("gateway.hooks.HOOKS_DIR", hooks_dir)
+    if timeout is not None:
+        monkeypatch.setattr(
+            "agent.pre_delivery.PRE_DELIVERY_HOOK_TIMEOUT_SECONDS", timeout
+        )
+
+    runner = _runner(monkeypatch, tmp_path)
+    runner.hooks = HookRegistry()
+    runner.hooks.discover_and_load()
+    _FinalizerAgent.persist_log = []
+    monkeypatch.setattr("run_agent.AIAgent", _FinalizerAgent)
+    event = _event()
+
+    response = await runner._handle_message_with_agent(
+        event,
+        event.source,
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response == DEGRADED_RESPONSE
+    assert "unsafe first completion" not in repr(_FinalizerAgent.persist_log)
+    appended = [
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) > 1
+    ]
+    assert "unsafe first completion" not in repr(appended)
+    assert any(message.get("content") == DEGRADED_RESPONSE for message in appended)

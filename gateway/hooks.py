@@ -90,6 +90,7 @@ class HookRegistry:
         self._authority_expected: Dict[str, set[str]] = {}
         self._authority_loaded: Dict[str, set[str]] = {}
         self._authority_failures: Dict[str, List[str]] = {}
+        self._sdgd_pre_delivery_off = False
 
     def _expect_authority(self, event_type: str, hook_name: str) -> None:
         self._authority_expected.setdefault(event_type, set()).add(hook_name)
@@ -114,9 +115,18 @@ class HookRegistry:
             for name in os.getenv(PRE_DELIVERY_AUTHORITY_ENV, "").split(",")
             if name.strip()
         ]
-        sdgd_mode = os.getenv(
-            "SDGD_HERMES_PRE_DELIVERY_GATE_MODE", "off"
-        ).strip().lower()
+        sdgd_mode_raw = os.getenv("SDGD_HERMES_PRE_DELIVERY_GATE_MODE")
+        sdgd_mode = str(sdgd_mode_raw or "").strip().lower()
+        self._sdgd_pre_delivery_off = (
+            sdgd_mode_raw is not None and sdgd_mode == "off"
+        )
+        if self._sdgd_pre_delivery_off:
+            # The explicit rollback lever wins even if a generic expectation
+            # was left behind.  The hook package may remain installed so
+            # observe/enforce can be restored without another file mutation.
+            configured = [
+                name for name in configured if name != "sdgd-pre-delivery"
+            ]
         if sdgd_mode in {"observe", "enforce"}:
             configured.append("sdgd-pre-delivery")
         for hook_name in configured:
@@ -176,7 +186,14 @@ class HookRegistry:
                     print(f"[hooks] Skipping {hook_name}: no events declared", flush=True)
                     continue
 
-                is_pre_delivery_authority = PRE_DELIVERY_EVENT in events
+                sdgd_authority_bypassed = (
+                    self._sdgd_pre_delivery_off
+                    and hook_name == "sdgd-pre-delivery"
+                )
+                is_pre_delivery_authority = (
+                    PRE_DELIVERY_EVENT in events
+                    and not sdgd_authority_bypassed
+                )
                 if is_pre_delivery_authority:
                     self._expect_authority(PRE_DELIVERY_EVENT, hook_name)
                 if not handler_path.exists():
@@ -227,6 +244,11 @@ class HookRegistry:
 
                 # Register the handler for each declared event
                 for event in events:
+                    if (
+                        event == PRE_DELIVERY_EVENT
+                        and sdgd_authority_bypassed
+                    ):
+                        continue
                     self._handlers.setdefault(event, []).append(handle_fn)
                 if is_pre_delivery_authority:
                     self._authority_loaded.setdefault(
