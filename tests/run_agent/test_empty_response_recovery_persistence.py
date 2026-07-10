@@ -1,6 +1,7 @@
 """Regression tests for empty-response recovery transcript persistence."""
 
 from run_agent import AIAgent
+from agent.pre_delivery import REJECTED_CANDIDATE_PLACEHOLDER
 
 
 class _CapturingSessionDB:
@@ -174,3 +175,40 @@ def test_flush_skips_thinking_prefill_scaffolding():
     agent._flush_messages_to_session_db(messages, conversation_history=[])
 
     assert [r["content"] for r in agent._session_db.rows] == ["hi", "Hello!"]
+
+
+def test_pre_delivery_recovery_prefix_matches_json_log_and_sqlite_surfaces():
+    """A continued turn must reuse the exact prefix already made durable."""
+    agent = _agent_with_capturing_db()
+    json_log_snapshots = []
+    agent._save_session_log = lambda messages: json_log_snapshots.append([
+        {"role": message.get("role"), "content": message.get("content")}
+        for message in messages
+    ])
+
+    durable_prefix = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": REJECTED_CANDIDATE_PLACEHOLDER,
+            "_pre_delivery_rejected": True,
+        },
+    ]
+    AIAgent._persist_session(agent, durable_prefix, conversation_history=[])
+
+    recovery_chain = durable_prefix + [
+        {"role": "user", "content": "Execute and prove it now."},
+        {"role": "assistant", "content": "Verified final proof."},
+    ]
+    AIAgent._persist_session(
+        agent,
+        recovery_chain,
+        conversation_history=durable_prefix,
+    )
+
+    assert json_log_snapshots[-1] == agent._session_db.rows
+    assert [row["role"] for row in agent._session_db.rows] == [
+        "user", "assistant", "user", "assistant"
+    ]
+    assert agent._session_db.rows[1]["content"] == REJECTED_CANDIDATE_PLACEHOLDER
+    assert agent._session_db.rows[-1]["content"] == "Verified final proof."

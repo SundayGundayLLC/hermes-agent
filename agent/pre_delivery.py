@@ -23,6 +23,9 @@ DEGRADED_RESPONSE = (
     "attempt. No unverified completion claim was delivered. Please retry or "
     "inspect the recorded turn proof."
 )
+REJECTED_CANDIDATE_PLACEHOLDER = (
+    "Candidate withheld by pre-delivery policy; recovery continuation required."
+)
 
 _VALID_DECISIONS = {"allow", "rewrite", "continue", "block"}
 _DECISION_PRIORITY = {"allow": 0, "rewrite": 1, "continue": 2, "block": 3}

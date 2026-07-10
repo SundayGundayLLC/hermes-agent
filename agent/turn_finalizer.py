@@ -159,6 +159,7 @@ def finalize_turn(
     if callable(_pre_delivery_callback) and not interrupted:
         from agent.pre_delivery import (
             DEGRADED_RESPONSE,
+            REJECTED_CANDIDATE_PLACEHOLDER,
             collect_tool_telemetry,
             normalize_decision,
         )
@@ -285,29 +286,65 @@ def finalize_turn(
             if messages and messages[-1].get("role") != "assistant":
                 messages.append({
                     "role": "assistant",
-                    "content": "No deliverable response was produced.",
+                    "content": REJECTED_CANDIDATE_PLACEHOLDER,
                     "_pre_delivery_rejected": True,
                 })
             elif messages and messages[-1].get("role") == "assistant":
+                messages[-1]["content"] = REJECTED_CANDIDATE_PLACEHOLDER
                 messages[-1]["_pre_delivery_rejected"] = True
-            return {
-                "final_response": "",
-                "messages": messages,
-                "api_calls": api_call_count,
-                "completed": False,
-                "failed": failed,
-                "interrupted": interrupted,
-                "pre_delivery_continue": True,
-                "pre_delivery_decision": _decision,
-                "pre_delivery_context": _decision_context,
-                "continuation_prompt": _decision["continuation_prompt"],
-                "model": agent.model,
-                "provider": agent.provider,
-                "api_mode": getattr(agent, "api_mode", None),
-                "session_id": agent.session_id,
-            }
+                for _private_key in (
+                    "reasoning",
+                    "reasoning_content",
+                    "reasoning_details",
+                ):
+                    messages[-1].pop(_private_key, None)
 
-        if _decision["decision"] in {"rewrite", "block"}:
+            # The returned history is passed as conversation_history to the
+            # bounded recovery run. Persist that exact safe chain now, after
+            # the continue decision, so JSONL and SQLite agree on which prefix
+            # is durable. The rejected candidate text itself is never stored.
+            try:
+                agent._persist_session(messages, conversation_history)
+            except Exception as _continue_persist_err:
+                logger.error(
+                    "pre-delivery continuation persistence failed closed: %s",
+                    _continue_persist_err,
+                    exc_info=True,
+                )
+                _decision = {
+                    "decision": "block",
+                    "response": DEGRADED_RESPONSE,
+                    "reason": "pre_delivery_continuation_persist_failed",
+                }
+                _pre_delivery_decision_result = _decision
+                _pre_delivery_blocked = True
+                final_response = DEGRADED_RESPONSE
+            else:
+                return {
+                    "final_response": "",
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": failed,
+                    "interrupted": interrupted,
+                    "pre_delivery_continue": True,
+                    "pre_delivery_decision": _decision,
+                    "pre_delivery_context": _decision_context,
+                    "continuation_prompt": _decision["continuation_prompt"],
+                    "model": agent.model,
+                    "provider": agent.provider,
+                    "api_mode": getattr(agent, "api_mode", None),
+                    "session_id": agent.session_id,
+                }
+
+        if _decision["decision"] == "allow":
+            # The gateway bridge may apply mandatory transport sanitization
+            # before invoking handlers. Persist and return exactly the
+            # candidate the authority hook inspected.
+            final_response = str(
+                _decision_context.get("candidate_final", final_response or "")
+            )
+        elif _decision["decision"] in {"rewrite", "block"}:
             final_response = _decision["response"]
         if _decision["decision"] == "block":
             _pre_delivery_blocked = True

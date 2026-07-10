@@ -11650,6 +11650,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            _has_pre_delivery_decision = (
+                agent_result.get("pre_delivery_decision") is not None
+            )
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -11663,7 +11666,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # produce visible content after exhausting all retries (nudge,
             # prefill, empty-retry, fallback).  Sending the raw sentinel
             # looks like a bug; a short explanation is more helpful.
-            if response == "(empty)" and not _intentional_silence:
+            if (
+                response == "(empty)"
+                and not _intentional_silence
+                and not _has_pre_delivery_decision
+            ):
                 response = (
                     "⚠️ The model returned no response after processing tool "
                     "results. This can happen with some models — try again or "
@@ -11706,7 +11713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
-            if not _intentional_silence:
+            if not _intentional_silence and not _has_pre_delivery_decision:
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
@@ -11757,7 +11764,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (
+                _show_reasoning_effective
+                and response
+                and not _intentional_silence
+                and not _has_pre_delivery_decision
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -11811,7 +11823,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            if (
+                _footer_line
+                and response
+                and not agent_result.get("already_sent")
+                and not _intentional_silence
+                and not _has_pre_delivery_decision
+            ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
@@ -12141,7 +12159,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if (
+                not _has_pre_delivery_decision
+                and self._should_send_voice_reply(
+                    event, response, agent_messages, already_sent=_already_sent
+                )
+            ):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -12155,7 +12178,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if (
+                not _has_pre_delivery_decision
+                and agent_result.get("already_sent")
+                and not agent_result.get("failed")
+            ):
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -17909,6 +17936,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pre_delivery_prior_telemetry,
                 current_telemetry,
             )
+            # Apply mandatory gateway redaction/sanitization before handlers
+            # decide. The finalizer persists the same inspected candidate, so
+            # no transport transform is needed after the authority hook.
+            context["candidate_final"] = _sanitize_gateway_final_response(
+                source.platform,
+                str(context.get("candidate_final") or ""),
+            )
             context.update(merged_telemetry)
             context.update({
                 "platform": source.platform.value if source.platform else "",
@@ -19005,6 +19039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            _pre_delivery_decision = result.get("pre_delivery_decision")
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -19137,7 +19172,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "context_length": _context_length,
                 }
 
-            if not final_response:
+            if not final_response and _pre_delivery_decision is None:
                 final_response = _normalize_empty_agent_response(
                     result, final_response or "", history_len=len(agent_history),
                 )
@@ -19167,6 +19202,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "api_mode": getattr(_agent, "api_mode", None) if _agent else None,
                     "base_url": getattr(_agent, "base_url", None) if _agent else None,
                     "context_length": _context_length,
+                    "pre_delivery_decision": result.get("pre_delivery_decision"),
+                    "pre_delivery_context": result.get("pre_delivery_context"),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -19189,7 +19226,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
+            if _pre_delivery_decision is None and "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
                     history_offset=len(agent_history),
@@ -19279,6 +19316,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "pre_delivery_decision": result.get("pre_delivery_decision"),
+                "pre_delivery_context": result.get("pre_delivery_context"),
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default

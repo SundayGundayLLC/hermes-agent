@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.pre_delivery import DEGRADED_RESPONSE
+from agent.pre_delivery import REJECTED_CANDIDATE_PLACEHOLDER
 from agent.turn_finalizer import finalize_turn
 
 
@@ -35,6 +36,8 @@ class FakeAgent:
         self._iters_since_skill = 0
         self.valid_tool_names = []
         self.persisted_messages = None
+        self.jsonl_messages = None
+        self.sqlite_messages = None
         self.pre_delivery_callback = None
         self.cleanup_calls = 0
         self.trajectory_calls = 0
@@ -59,6 +62,8 @@ class FakeAgent:
 
     def _persist_session(self, messages, conversation_history):
         self.persisted_messages = list(messages)
+        self.jsonl_messages = [dict(message) for message in messages]
+        self.sqlite_messages = [dict(message) for message in messages]
 
     def _file_mutation_verifier_enabled(self):
         return False
@@ -212,10 +217,13 @@ def test_unproven_candidate_continues_without_terminal_persistence(
 
     assert result["pre_delivery_continue"] is True
     assert result["continuation_prompt"] == decision["continuation_prompt"]
-    assert agent.persisted_messages is None
+    assert agent.persisted_messages[-1]["content"] == REJECTED_CANDIDATE_PLACEHOLDER
     assert agent.trajectory_calls == 0
     assert agent.cleanup_calls == 0
     assert result["messages"][-1]["_pre_delivery_rejected"] is True
+    assert candidate not in [
+        message.get("content") for message in agent.persisted_messages
+    ]
 
 
 def test_valid_blocked_response_can_be_allowed_without_tools(monkeypatch):
@@ -322,13 +330,62 @@ def test_first_empty_candidate_gets_one_unpersisted_recovery(monkeypatch):
     assert captured[0]["is_empty"] is True
     assert result["pre_delivery_continue"] is True
     assert result["continuation_prompt"] == "Recover once."
-    assert agent.persisted_messages is None
+    assert agent.persisted_messages[-1]["content"] == REJECTED_CANDIDATE_PLACEHOLDER
     assert all(
         not message.get("_empty_terminal_sentinel")
         for message in result["messages"]
     )
     assert result["messages"][-1]["role"] == "assistant"
     assert result["messages"][-1]["_pre_delivery_rejected"] is True
+
+
+def test_continue_and_final_share_one_jsonl_sqlite_chain(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    rejected = "I finished it without proof."
+    agent.pre_delivery_callback = lambda _context: {
+        "decision": "continue",
+        "continuation_prompt": "Execute and prove it now.",
+    }
+    first_messages = [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": rejected},
+    ]
+
+    continued = _finalize_with_gate(agent, first_messages, rejected)
+    assert agent.jsonl_messages == agent.sqlite_messages
+    assert agent.jsonl_messages[-1]["content"] == REJECTED_CANDIDATE_PLACEHOLDER
+
+    durable_prefix = list(continued["messages"])
+    final_messages = durable_prefix + [
+        {"role": "user", "content": continued["continuation_prompt"]},
+        {"role": "assistant", "content": "Verified final proof."},
+    ]
+    agent.pre_delivery_callback = lambda _context: {"decision": "allow"}
+    finalized = finalize_turn(
+        agent,
+        final_response="Verified final proof.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=final_messages,
+        conversation_history=durable_prefix,
+        effective_task_id="task",
+        turn_id="turn-1432-recovery",
+        user_message=continued["continuation_prompt"],
+        original_user_message=continued["continuation_prompt"],
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert finalized["final_response"] == "Verified final proof."
+    assert agent.jsonl_messages == agent.sqlite_messages
+    assert [message["role"] for message in agent.jsonl_messages[-4:]] == [
+        "user", "assistant", "user", "assistant"
+    ]
+    assert rejected not in [
+        message.get("content") for message in agent.jsonl_messages
+    ]
 
 
 def test_callback_error_fails_closed_before_persistence(monkeypatch):
