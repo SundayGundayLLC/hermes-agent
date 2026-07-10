@@ -18,10 +18,10 @@ Events:
   - command:*           -- Any slash command executed (wildcard match)
 
 Errors in advisory hooks are caught and logged but never block the main
-pipeline. ``agent:pre_delivery`` is an authority hook: when registered, an
-exception or malformed decision fails closed; ``None`` is an observer-only
-abstention. Only exact ``agent:pre_delivery`` registrations activate the gate
-(``agent:*`` remains advisory).
+pipeline. ``agent:pre_delivery`` is an authority hook: when declared,
+configured, or registered, discovery/import/dispatch failures and missing or
+malformed decisions fail closed. Observer silence belongs on ``agent:*``;
+only exact ``agent:pre_delivery`` registrations activate the gate.
 
 Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   platform     -- source platform name (e.g. "telegram", "matrix", "slack")
@@ -55,6 +55,7 @@ and ``thread_id`` is non-empty.
 import asyncio
 import importlib.util
 import inspect
+import os
 import sys
 from typing import Any, Callable, Dict, List, Optional
 
@@ -64,6 +65,12 @@ from hermes_cli.config import get_hermes_home
 
 
 HOOKS_DIR = get_hermes_home() / "hooks"
+PRE_DELIVERY_EVENT = "agent:pre_delivery"
+PRE_DELIVERY_AUTHORITY_ENV = "HERMES_PRE_DELIVERY_AUTHORITY"
+
+
+class HookAuthorityError(RuntimeError):
+    """Raised when a configured decision authority cannot run safely."""
 
 
 class HookRegistry:
@@ -80,6 +87,40 @@ class HookRegistry:
         # event_type -> [handler_fn, ...]
         self._handlers: Dict[str, List[Callable]] = {}
         self._loaded_hooks: List[dict] = []  # metadata for listing
+        self._authority_expected: Dict[str, set[str]] = {}
+        self._authority_loaded: Dict[str, set[str]] = {}
+        self._authority_failures: Dict[str, List[str]] = {}
+
+    def _expect_authority(self, event_type: str, hook_name: str) -> None:
+        self._authority_expected.setdefault(event_type, set()).add(hook_name)
+
+    def _authority_failed(
+        self, event_type: str, hook_name: str, reason: str
+    ) -> None:
+        self._authority_failures.setdefault(event_type, []).append(
+            f"{hook_name}: {reason}"
+        )
+
+    def _register_configured_authorities(self) -> None:
+        """Record authorities whose absence must stop startup.
+
+        The generic setting accepts a comma-separated list of exact hook
+        names.  The SDGD compatibility setting is intentionally narrow: only
+        observe/enforce requires its named authority; off preserves the
+        legacy no-gate behavior.
+        """
+        configured = [
+            name.strip()
+            for name in os.getenv(PRE_DELIVERY_AUTHORITY_ENV, "").split(",")
+            if name.strip()
+        ]
+        sdgd_mode = os.getenv(
+            "SDGD_HERMES_PRE_DELIVERY_GATE_MODE", "off"
+        ).strip().lower()
+        if sdgd_mode in {"observe", "enforce"}:
+            configured.append("sdgd-pre-delivery")
+        for hook_name in configured:
+            self._expect_authority(PRE_DELIVERY_EVENT, hook_name)
 
     @property
     def loaded_hooks(self) -> List[dict]:
@@ -106,8 +147,10 @@ class HookRegistry:
           - handler.py with a top-level 'handle' function (sync or async)
         """
         self._register_builtin_hooks()
+        self._register_configured_authorities()
 
         if not HOOKS_DIR.exists():
+            self.assert_expected_authorities_healthy()
             return
 
         for hook_dir in sorted(HOOKS_DIR.iterdir()):
@@ -116,8 +159,9 @@ class HookRegistry:
 
             manifest_path = hook_dir / "HOOK.yaml"
             handler_path = hook_dir / "handler.py"
+            hook_name = hook_dir.name
 
-            if not manifest_path.exists() or not handler_path.exists():
+            if not manifest_path.exists():
                 continue
 
             try:
@@ -130,6 +174,16 @@ class HookRegistry:
                 events = manifest.get("events", [])
                 if not events:
                     print(f"[hooks] Skipping {hook_name}: no events declared", flush=True)
+                    continue
+
+                is_pre_delivery_authority = PRE_DELIVERY_EVENT in events
+                if is_pre_delivery_authority:
+                    self._expect_authority(PRE_DELIVERY_EVENT, hook_name)
+                if not handler_path.exists():
+                    if is_pre_delivery_authority:
+                        self._authority_failed(
+                            PRE_DELIVERY_EVENT, hook_name, "handler.py is missing"
+                        )
                     continue
 
                 # Dynamically load the handler module.
@@ -158,11 +212,26 @@ class HookRegistry:
                 handle_fn = getattr(module, "handle", None)
                 if handle_fn is None:
                     print(f"[hooks] Skipping {hook_name}: no 'handle' function found", flush=True)
+                    if is_pre_delivery_authority:
+                        self._authority_failed(
+                            PRE_DELIVERY_EVENT, hook_name, "handle is missing"
+                        )
+                    continue
+                if not callable(handle_fn):
+                    print(f"[hooks] Skipping {hook_name}: 'handle' is not callable", flush=True)
+                    if is_pre_delivery_authority:
+                        self._authority_failed(
+                            PRE_DELIVERY_EVENT, hook_name, "handle is not callable"
+                        )
                     continue
 
                 # Register the handler for each declared event
                 for event in events:
                     self._handlers.setdefault(event, []).append(handle_fn)
+                if is_pre_delivery_authority:
+                    self._authority_loaded.setdefault(
+                        PRE_DELIVERY_EVENT, set()
+                    ).add(hook_name)
 
                 self._loaded_hooks.append({
                     "name": hook_name,
@@ -175,6 +244,80 @@ class HookRegistry:
 
             except Exception as e:
                 print(f"[hooks] Error loading hook {hook_dir.name}: {e}", flush=True)
+                # A valid manifest may have established the exact authority
+                # expectation before import failed.  Preserve that failure so
+                # startup cannot silently continue without the gate.
+                expected_names = self._authority_expected.get(
+                    PRE_DELIVERY_EVENT, set()
+                )
+                matching = str(locals().get("hook_name") or hook_dir.name)
+                if matching in expected_names:
+                    self._authority_failed(
+                        PRE_DELIVERY_EVENT,
+                        matching,
+                        f"load failed: {type(e).__name__}: {e}",
+                    )
+
+        self.assert_expected_authorities_healthy()
+
+    def authority_expected(self, event_type: str) -> bool:
+        """Return whether an exact decision authority is required."""
+        return bool(
+            self._authority_expected.get(event_type)
+            or self._resolve_handlers(event_type, include_wildcards=False)
+        )
+
+    def assert_authority_healthy(self, event_type: str) -> None:
+        """Refuse an expected authority that is absent or failed discovery."""
+        expected = self._authority_expected.get(event_type, set())
+        loaded = self._authority_loaded.get(event_type, set())
+        failures = list(self._authority_failures.get(event_type, []))
+        missing = sorted(expected - loaded)
+        if missing:
+            failures.append("missing configured authority: " + ", ".join(missing))
+        if expected and not self._resolve_handlers(
+            event_type, include_wildcards=False
+        ):
+            failures.append("no exact authority handler registered")
+        if failures:
+            raise HookAuthorityError(
+                f"{event_type} authority unavailable: " + "; ".join(failures)
+            )
+
+    def assert_expected_authorities_healthy(self) -> None:
+        for event_type in sorted(self._authority_expected):
+            self.assert_authority_healthy(event_type)
+
+    async def emit_authority(
+        self, event_type: str, context: Optional[Dict[str, Any]] = None,
+        *, run_sync_in_executor: bool = False,
+    ) -> List[Any]:
+        """Dispatch an exact authority without advisory fail-open semantics."""
+        self.assert_authority_healthy(event_type)
+        handlers = self._resolve_handlers(event_type, include_wildcards=False)
+        if not handlers:
+            raise HookAuthorityError(
+                f"{event_type} authority dispatch found no exact handlers"
+            )
+        context = {} if context is None else context
+        results: List[Any] = []
+        for fn in handlers:
+            if run_sync_in_executor and not inspect.iscoroutinefunction(fn):
+                result = await asyncio.to_thread(fn, event_type, context)
+            else:
+                result = fn(event_type, context)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is None:
+                raise HookAuthorityError(
+                    f"{event_type} authority handler returned no decision"
+                )
+            results.append(result)
+        if not results:
+            raise HookAuthorityError(
+                f"{event_type} authority dispatch returned no decisions"
+            )
+        return results
 
     def _resolve_handlers(
         self, event_type: str, *, include_wildcards: bool = True

@@ -26,17 +26,18 @@ def test_decision_reducer_is_conservative_and_stable():
     }
 
 
-@pytest.mark.parametrize("value", [None, {}, {"decision": "maybe"}])
+@pytest.mark.parametrize("value", [None, [], {}, {"decision": "maybe"}])
 def test_malformed_registered_decision_fails_closed(value):
     with pytest.raises(PreDeliveryDecisionError):
         reduce_decisions([] if value is None else [value])
 
 
-def test_none_only_observer_is_neutral_when_allowed():
-    assert reduce_decisions([], allow_empty=True) == {
-        "decision": "allow",
-        "reason": "pre_delivery_observers_only",
-    }
+def test_empty_authority_result_never_allows_delivery():
+    with pytest.raises(
+        PreDeliveryDecisionError,
+        match="registered pre-delivery handlers returned no decision",
+    ):
+        reduce_decisions([])
 
 
 def test_agent_end_summary_is_compact_and_allowlisted():

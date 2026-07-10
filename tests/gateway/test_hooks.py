@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from gateway.hooks import HookRegistry
+from gateway.hooks import HookAuthorityError, HookRegistry
 
 
 def _create_hook(hooks_dir, hook_name, events, handler_code):
@@ -385,3 +385,129 @@ class TestEmitCollect:
             await reg.emit_collect(
                 "agent:pre_delivery", {}, raise_exceptions=True
             )
+
+
+class TestAuthorityDispatch:
+    def test_no_configured_authority_preserves_legacy_behavior(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", tmp_path / "missing")
+        monkeypatch.delenv("HERMES_PRE_DELIVERY_AUTHORITY", raising=False)
+        monkeypatch.delenv(
+            "SDGD_HERMES_PRE_DELIVERY_GATE_MODE", raising=False
+        )
+        reg = HookRegistry()
+
+        reg.discover_and_load()
+
+        assert reg.authority_expected("agent:pre_delivery") is False
+
+    @pytest.mark.asyncio
+    async def test_wildcard_observer_silence_is_not_authority(
+        self, monkeypatch, tmp_path
+    ):
+        hooks_dir = tmp_path / "hooks"
+        _create_hook(
+            hooks_dir,
+            "observer",
+            "[agent:*]",
+            "def handle(event_type, context):\n    return None\n",
+        )
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", hooks_dir)
+        reg = HookRegistry()
+        reg.discover_and_load()
+
+        await reg.emit("agent:pre_delivery", {})
+
+        assert reg.authority_expected("agent:pre_delivery") is False
+
+    @pytest.mark.asyncio
+    async def test_real_discovery_and_exact_authority_dispatch(
+        self, monkeypatch, tmp_path
+    ):
+        hooks_dir = tmp_path / "hooks"
+        _create_hook(
+            hooks_dir,
+            "gate",
+            "[agent:pre_delivery]",
+            "def handle(event_type, context):\n"
+            "    return {'decision': 'allow', 'message_id': context['message_id']}\n",
+        )
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", hooks_dir)
+        reg = HookRegistry()
+        reg.discover_and_load()
+
+        results = await reg.emit_authority(
+            "agent:pre_delivery", {"message_id": "original-42"}
+        )
+
+        assert results == [{"decision": "allow", "message_id": "original-42"}]
+
+    @pytest.mark.parametrize(
+        ("handler_code", "match"),
+        [
+            ("raise RuntimeError('import boom')\n", "load failed"),
+            ("value = 1\n", "handle is missing"),
+        ],
+    )
+    def test_declared_authority_discovery_failure_stops_startup(
+        self, monkeypatch, tmp_path, handler_code, match
+    ):
+        hooks_dir = tmp_path / "hooks"
+        _create_hook(
+            hooks_dir, "gate", "[agent:pre_delivery]", handler_code
+        )
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", hooks_dir)
+        reg = HookRegistry()
+
+        with pytest.raises(HookAuthorityError, match=match):
+            reg.discover_and_load()
+
+    def test_configured_missing_authority_stops_startup(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", tmp_path / "missing")
+        monkeypatch.setenv("HERMES_PRE_DELIVERY_AUTHORITY", "required-gate")
+        reg = HookRegistry()
+
+        with pytest.raises(
+            HookAuthorityError, match="missing configured authority: required-gate"
+        ):
+            reg.discover_and_load()
+
+    def test_sdgd_enforce_mode_requires_named_authority(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", tmp_path / "missing")
+        monkeypatch.setenv("SDGD_HERMES_PRE_DELIVERY_GATE_MODE", "enforce")
+        reg = HookRegistry()
+
+        with pytest.raises(
+            HookAuthorityError, match="missing configured authority: sdgd-pre-delivery"
+        ):
+            reg.discover_and_load()
+
+    @pytest.mark.asyncio
+    async def test_none_or_exception_from_authority_fails_closed(
+        self, monkeypatch, tmp_path
+    ):
+        hooks_dir = tmp_path / "hooks"
+        hook_dir = _create_hook(
+            hooks_dir,
+            "gate",
+            "[agent:pre_delivery]",
+            "def handle(event_type, context):\n    return None\n",
+        )
+        monkeypatch.setattr("gateway.hooks.HOOKS_DIR", hooks_dir)
+        reg = HookRegistry()
+        reg.discover_and_load()
+        with pytest.raises(HookAuthorityError, match="returned no decision"):
+            await reg.emit_authority("agent:pre_delivery", {})
+
+        (hook_dir / "handler.py").write_text(
+            "def handle(event_type, context):\n    raise RuntimeError('dispatch boom')\n"
+        )
+        reg = HookRegistry()
+        reg.discover_and_load()
+        with pytest.raises(RuntimeError, match="dispatch boom"):
+            await reg.emit_authority("agent:pre_delivery", {})

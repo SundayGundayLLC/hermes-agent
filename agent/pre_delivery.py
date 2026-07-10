@@ -67,17 +67,10 @@ def normalize_decision(value: Any) -> Dict[str, Any]:
     return result
 
 
-def reduce_decisions(
-    values: Iterable[Any], *, allow_empty: bool = False
-) -> Dict[str, Any]:
+def reduce_decisions(values: Iterable[Any]) -> Dict[str, Any]:
     """Reduce multiple hook results deterministically and conservatively."""
     normalized = [normalize_decision(value) for value in values]
     if not normalized:
-        if allow_empty:
-            return {
-                "decision": "allow",
-                "reason": "pre_delivery_observers_only",
-            }
         raise PreDeliveryDecisionError(
             "registered pre-delivery handlers returned no decision"
         )
