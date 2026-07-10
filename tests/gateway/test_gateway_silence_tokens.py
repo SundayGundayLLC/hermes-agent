@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
+from agent.pre_delivery import DEGRADED_RESPONSE
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
@@ -163,3 +164,90 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
     )
 
     assert response == text
+
+
+@pytest.mark.asyncio
+async def test_blocked_pre_delivery_text_is_final_authority(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._show_reasoning = True
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "display": {
+                "show_reasoning": True,
+                "runtime_footer": {"enabled": True},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.runtime_footer.build_footer_line",
+        lambda **_kwargs: "runtime footer must not leak",
+    )
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": DEGRADED_RESPONSE,
+        "last_reasoning": "private reasoning must not leak",
+        "messages": [
+            {"role": "user", "content": "make an image"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {"name": "image_generate", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "image_generate",
+                "content": "MEDIA:C:\\tmp\\secret.png",
+            },
+            {"role": "assistant", "content": DEGRADED_RESPONSE},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 2,
+        "failed": False,
+        # Even a stale preview flag cannot suppress the authoritative block.
+        "already_sent": True,
+        "pre_delivery_decision": {
+            "decision": "block",
+            "response": DEGRADED_RESPONSE,
+            "reason": "pre_delivery_continuation_exhausted",
+        },
+        "pre_delivery_context": {
+            "attempt": 1,
+            "empty_count": 2,
+            "tool_call_count": 1,
+            "tool_result_count": 1,
+            "original_message": "private original request",
+            "candidate_final": "private rejected candidate",
+            "tool_calls": [{"arguments": "private arguments"}],
+            "tool_results": [{"content": "private tool output"}],
+        },
+    })
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == DEGRADED_RESPONSE
+    assert "MEDIA:" not in response
+    assert "private reasoning" not in response
+    assert "runtime footer" not in response
+    emitted = [call.args for call in runner.hooks.emit.await_args_list]
+    assert emitted[-1][0] == "agent:end"
+    assert emitted[-1][1]["response"] == DEGRADED_RESPONSE[:500]
+    assert emitted[-1][1]["pre_delivery_decision"] == {
+        "decision": "block",
+        "reason": "pre_delivery_continuation_exhausted",
+        "attempt": 1,
+        "empty_count": 2,
+        "tool_call_count": 1,
+        "tool_result_count": 1,
+    }
+    assert "pre_delivery_context" not in emitted[-1][1]
+    assert "private original request" not in repr(emitted[-1][1])
+    assert "private arguments" not in repr(emitted[-1][1])

@@ -145,11 +145,238 @@ def finalize_turn(
                     exc_info=True,
                 )
 
+    # A gateway pre-delivery hook is the last authority over user-visible
+    # candidate text.  Run it before trajectory/session success persistence or
+    # resource cleanup.  A ``continue`` decision returns the in-memory turn to
+    # the gateway without recording the rejected candidate as terminal; the
+    # gateway then performs one bounded continuation using these messages.
+    _pre_delivery_prepared = False
+    _response_transformed = False
+    _pre_delivery_decision_result = None
+    _pre_delivery_context_result = None
+    _pre_delivery_blocked = False
+    _pre_delivery_callback = getattr(agent, "pre_delivery_callback", None)
+    if callable(_pre_delivery_callback) and not interrupted:
+        from agent.pre_delivery import (
+            DEGRADED_RESPONSE,
+            REJECTED_CANDIDATE_PLACEHOLDER,
+            collect_tool_telemetry,
+            normalize_decision,
+        )
+
+        _raw_candidate_final = final_response
+
+        # Apply the existing final text transforms before the authority hook so
+        # neither a verifier footer nor an output plugin can change text after
+        # it has been approved.  The legacy no-hook order remains untouched.
+        if final_response:
+            try:
+                _failed_mutations = (
+                    getattr(agent, "_turn_failed_file_mutations", None) or {}
+                )
+                if _failed_mutations and agent._file_mutation_verifier_enabled():
+                    _footer = agent._format_file_mutation_failure_footer(
+                        _failed_mutations
+                    )
+                    if _footer:
+                        final_response = final_response.rstrip() + "\n\n" + _footer
+            except Exception as _ver_err:
+                logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+
+        try:
+            if agent._turn_completion_explainer_enabled():
+                _stripped = (final_response or "").strip()
+                _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
+                _is_partial_fragment = (
+                    not _is_empty_terminal
+                    and not preserved_verification_fallback
+                    and not str(_turn_exit_reason).startswith("text_response")
+                    and len(_stripped) <= 24
+                    and _stripped[-1:]
+                    not in {".", "!", "?", "。", "！", "？", "`", ")"}
+                )
+                _is_partial_stream_recovery = (
+                    str(_turn_exit_reason) == "partial_stream_recovery"
+                )
+                if (
+                    _is_empty_terminal
+                    or _is_partial_fragment
+                    or _is_partial_stream_recovery
+                ):
+                    _explanation = agent._format_turn_completion_explanation(
+                        _turn_exit_reason
+                    )
+                    if _explanation:
+                        final_response = (
+                            _explanation
+                            if _is_empty_terminal
+                            else _stripped + "\n\n" + _explanation
+                        )
+        except Exception as _exp_err:
+            logger.debug("turn-completion explainer failed: %s", _exp_err)
+
+        if final_response:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+                _transform_results = _invoke_hook(
+                    "transform_llm_output",
+                    response_text=final_response,
+                    session_id=agent.session_id or "",
+                    model=agent.model,
+                    platform=getattr(agent, "platform", None) or "",
+                )
+                for _hook_result in _transform_results:
+                    if isinstance(_hook_result, str) and _hook_result:
+                        final_response = _hook_result
+                        _response_transformed = True
+                        break
+            except Exception as exc:
+                logger.warning("transform_llm_output hook failed: %s", exc)
+
+        _tool_telemetry = collect_tool_telemetry(
+            messages, conversation_history
+        )
+        _decision_context = {
+            "candidate_final": final_response or "",
+            "raw_candidate_final": _raw_candidate_final or "",
+            "is_empty": not str(_raw_candidate_final or "").strip()
+            or str(_raw_candidate_final or "").strip() == "(empty)",
+            "original_message": original_user_message,
+            "turn_id": turn_id,
+            "task_id": effective_task_id,
+            "session_id": agent.session_id or "",
+            "model": agent.model,
+            "provider": agent.provider,
+            "api_mode": getattr(agent, "api_mode", None),
+            "base_url": agent.base_url,
+            "api_calls": api_call_count,
+            "turn_exit_reason": _turn_exit_reason,
+            "failed": failed,
+            "interrupted": interrupted,
+            **_tool_telemetry,
+        }
+        try:
+            _decision = normalize_decision(
+                _pre_delivery_callback(_decision_context)
+            )
+        except Exception as _decision_err:
+            logger.error(
+                "pre-delivery callback failed closed: %s",
+                _decision_err,
+                exc_info=True,
+            )
+            _decision = {
+                "decision": "block",
+                "response": DEGRADED_RESPONSE,
+                "reason": f"pre_delivery_error:{type(_decision_err).__name__}",
+            }
+        _pre_delivery_decision_result = _decision
+        _pre_delivery_context_result = _decision_context
+
+        if _decision["decision"] == "continue":
+            # Remove only the private terminal-empty sentinel.  Preserve real
+            # tool calls/results for the continuation and its telemetry.
+            while (
+                messages
+                and isinstance(messages[-1], dict)
+                and messages[-1].get("_empty_terminal_sentinel")
+            ):
+                messages.pop()
+            _safe_rejected_message = {
+                "role": "assistant",
+                "content": REJECTED_CANDIDATE_PLACEHOLDER,
+                "_pre_delivery_rejected": True,
+                "_pre_delivery_status": "rejected_nonterminal",
+            }
+            if messages and messages[-1].get("role") == "assistant":
+                # Rebuild from an allowlist instead of deleting known fields.
+                # Provider adapters may add new replay/raw payload keys over
+                # time; none may survive into a rejected durable placeholder.
+                messages[-1] = _safe_rejected_message
+            else:
+                messages.append(_safe_rejected_message)
+
+            # The returned history is passed as conversation_history to the
+            # bounded recovery run. Persist that exact safe chain now, after
+            # the continue decision, so JSONL and SQLite agree on which prefix
+            # is durable. The rejected candidate text itself is never stored.
+            try:
+                _persisted = agent._persist_session(
+                    messages, conversation_history
+                )
+                if _persisted is not True:
+                    raise RuntimeError(
+                        "session store did not confirm placeholder persistence"
+                    )
+            except Exception as _continue_persist_err:
+                logger.error(
+                    "pre-delivery continuation persistence failed closed: %s",
+                    _continue_persist_err,
+                    exc_info=True,
+                )
+                _decision = {
+                    "decision": "block",
+                    "response": DEGRADED_RESPONSE,
+                    "reason": "pre_delivery_continuation_persist_failed",
+                }
+                _pre_delivery_decision_result = _decision
+                _pre_delivery_blocked = True
+                final_response = DEGRADED_RESPONSE
+            else:
+                return {
+                    "final_response": "",
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": failed,
+                    "interrupted": interrupted,
+                    "pre_delivery_continue": True,
+                    "pre_delivery_decision": _decision,
+                    "pre_delivery_context": _decision_context,
+                    "continuation_prompt": _decision["continuation_prompt"],
+                    "model": agent.model,
+                    "provider": agent.provider,
+                    "api_mode": getattr(agent, "api_mode", None),
+                    "session_id": agent.session_id,
+                }
+
+        if _decision["decision"] == "allow":
+            # The gateway bridge may apply mandatory transport sanitization
+            # before invoking handlers. Persist and return exactly the
+            # candidate the authority hook inspected.
+            final_response = str(
+                _decision_context.get("candidate_final", final_response or "")
+            )
+        elif _decision["decision"] in {"rewrite", "block"}:
+            final_response = _decision["response"]
+        if _decision["decision"] == "block":
+            _pre_delivery_blocked = True
+
+        # Make the durable assistant row exactly match the approved/replaced
+        # candidate.  This also turns an empty terminal sentinel into a normal
+        # assistant row without deleting its preceding tool evidence.
+        _terminal_assistant = (
+            messages[-1]
+            if messages
+            and isinstance(messages[-1], dict)
+            and messages[-1].get("role") == "assistant"
+            else None
+        )
+        if _terminal_assistant is None:
+            messages.append({"role": "assistant", "content": final_response or ""})
+        else:
+            _terminal_assistant["content"] = final_response or ""
+            _terminal_assistant.pop("_empty_terminal_sentinel", None)
+            _terminal_assistant.pop("_empty_recovery_synthetic", None)
+        _pre_delivery_prepared = True
+
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
         final_response is not None
         and not failed
+        and not _pre_delivery_blocked
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -292,7 +519,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _pre_delivery_prepared:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -318,7 +545,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not _pre_delivery_prepared:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -359,13 +586,14 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
-    _response_transformed = False
+    # When the pre-delivery path is active, transforms already ran before the
+    # authority hook and persistence.  Legacy turns retain the old ordering.
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _pre_delivery_prepared:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -453,6 +681,9 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if _pre_delivery_decision_result is not None:
+        result["pre_delivery_decision"] = _pre_delivery_decision_result
+        result["pre_delivery_context"] = _pre_delivery_context_result
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

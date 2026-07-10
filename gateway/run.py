@@ -11563,20 +11563,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
+            _pre_delivery_attempt = 0
+            _pre_delivery_empty_count = 0
+            _pre_delivery_prior_telemetry: Dict[str, Any] = {}
+            _agent_history = history
+            _agent_message = message_text
+            _agent_session_id = _run_start_session_id
+            _root_history_offset = len(history)
+            while True:
+                agent_result = await self._run_agent(
+                    message=_agent_message,
+                    context_prompt=context_prompt,
+                    history=_agent_history,
+                    source=source,
+                    session_id=_agent_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=(
+                        self._reply_anchor_for_event(event)
+                        if _pre_delivery_attempt == 0
+                        else None
+                    ),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=(
+                        persist_user_message if _pre_delivery_attempt == 0 else None
+                    ),
+                    persist_user_timestamp=(
+                        persist_user_timestamp if _pre_delivery_attempt == 0 else None
+                    ),
+                    pre_delivery_attempt=_pre_delivery_attempt,
+                    pre_delivery_prior_telemetry=_pre_delivery_prior_telemetry,
+                    pre_delivery_empty_count=_pre_delivery_empty_count,
+                )
+                if not agent_result.get("pre_delivery_continue"):
+                    break
+
+                _pre_ctx = agent_result.get("pre_delivery_context") or {}
+                _pre_delivery_prior_telemetry = {
+                    "tool_call_count": _pre_ctx.get("tool_call_count", 0),
+                    "tool_result_count": _pre_ctx.get("tool_result_count", 0),
+                    "tool_calls": list(_pre_ctx.get("tool_calls") or []),
+                    "tool_results": list(_pre_ctx.get("tool_results") or []),
+                }
+                _pre_delivery_empty_count = int(
+                    _pre_ctx.get("empty_count", _pre_delivery_empty_count) or 0
+                )
+                _agent_history = list(agent_result.get("messages") or [])
+                _agent_message = str(agent_result.get("continuation_prompt") or "")
+                _agent_session_id = str(
+                    agent_result.get("session_id") or _agent_session_id
+                )
+                _pre_delivery_attempt += 1
+
+            # The final result may include the rejected candidate and recovery
+            # prompt from attempt zero. Persist the complete bounded chain, not
+            # only the final attempt's suffix. Compression still owns offset 0.
+            if (
+                _pre_delivery_attempt
+                and agent_result.get("history_offset", 0) != 0
+            ):
+                agent_result["history_offset"] = _root_history_offset
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -11603,6 +11650,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            _has_pre_delivery_decision = (
+                agent_result.get("pre_delivery_decision") is not None
+            )
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -11616,7 +11666,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # produce visible content after exhausting all retries (nudge,
             # prefill, empty-retry, fallback).  Sending the raw sentinel
             # looks like a bug; a short explanation is more helpful.
-            if response == "(empty)" and not _intentional_silence:
+            if (
+                response == "(empty)"
+                and not _intentional_silence
+                and not _has_pre_delivery_decision
+            ):
                 response = (
                     "⚠️ The model returned no response after processing tool "
                     "results. This can happen with some models — try again or "
@@ -11659,7 +11713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
-            if not _intentional_silence:
+            if not _intentional_silence and not _has_pre_delivery_decision:
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
@@ -11710,7 +11764,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (
+                _show_reasoning_effective
+                and response
+                and not _intentional_silence
+                and not _has_pre_delivery_decision
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -11764,14 +11823,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            if (
+                _footer_line
+                and response
+                and not agent_result.get("already_sent")
+                and not _intentional_silence
+                and not _has_pre_delivery_decision
+            ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
-            await self.hooks.emit("agent:end", {
+            _agent_end_ctx = {
                 **hook_ctx,
                 "response": (response or "")[:500],
-            })
+            }
+            if agent_result.get("pre_delivery_decision") is not None:
+                from agent.pre_delivery import compact_decision_summary
+                _agent_end_ctx["pre_delivery_decision"] = compact_decision_summary(
+                    agent_result.get("pre_delivery_decision") or {},
+                    agent_result.get("pre_delivery_context") or {},
+                )
+            await self.hooks.emit("agent:end", _agent_end_ctx)
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -12086,7 +12158,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if (
+                not _has_pre_delivery_decision
+                and self._should_send_voice_reply(
+                    event, response, agent_messages, already_sent=_already_sent
+                )
+            ):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -12100,7 +12177,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if (
+                not _has_pre_delivery_decision
+                and agent_result.get("already_sent")
+                and not agent_result.get("failed")
+            ):
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -16872,6 +16953,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        pre_delivery_attempt: int = 0,
+        pre_delivery_prior_telemetry: Optional[Dict[str, Any]] = None,
+        pre_delivery_empty_count: int = 0,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -16890,6 +16974,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                pre_delivery_attempt=pre_delivery_attempt,
+                pre_delivery_prior_telemetry=pre_delivery_prior_telemetry,
+                pre_delivery_empty_count=pre_delivery_empty_count,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -16901,6 +16988,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                pre_delivery_attempt=pre_delivery_attempt,
+                pre_delivery_prior_telemetry=pre_delivery_prior_telemetry,
+                pre_delivery_empty_count=pre_delivery_empty_count,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -16933,6 +17023,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        pre_delivery_attempt: int = 0,
+        pre_delivery_prior_telemetry: Optional[Dict[str, Any]] = None,
+        pre_delivery_empty_count: int = 0,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -16947,6 +17040,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
+        _pre_delivery_enabled = self.hooks.has_exact_handlers(
+            "agent:pre_delivery"
+        )
+        if self._get_proxy_url() and _pre_delivery_enabled:
+            from agent.pre_delivery import DEGRADED_RESPONSE
+            return {
+                "final_response": DEGRADED_RESPONSE,
+                "messages": [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": DEGRADED_RESPONSE},
+                ],
+                "api_calls": 0,
+                "failed": True,
+                "error": "pre_delivery_local_atomicity_unavailable_in_proxy_mode",
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": session_id,
+            }
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message,
@@ -17807,6 +17918,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _loop_for_step = asyncio.get_running_loop()
         _hooks_ref = self.hooks
 
+        def _pre_delivery_callback_sync(context: dict) -> dict:
+            """Bridge the agent's atomic sync seam to async gateway hooks."""
+            from agent.pre_delivery import (
+                MAX_PRE_DELIVERY_CONTINUATIONS,
+                PRE_DELIVERY_HOOK_TIMEOUT_SECONDS,
+                enforce_continuation_budget,
+                merge_tool_telemetry,
+                reduce_decisions,
+                wait_for_authority_future,
+            )
+
+            current_telemetry = {
+                "tool_call_count": context.get("tool_call_count", 0),
+                "tool_result_count": context.get("tool_result_count", 0),
+                "tool_calls": list(context.get("tool_calls") or []),
+                "tool_results": list(context.get("tool_results") or []),
+            }
+            merged_telemetry = merge_tool_telemetry(
+                pre_delivery_prior_telemetry,
+                current_telemetry,
+            )
+            # Apply mandatory gateway redaction/sanitization before handlers
+            # decide. The finalizer persists the same inspected candidate, so
+            # no transport transform is needed after the authority hook.
+            context["candidate_final"] = _sanitize_gateway_final_response(
+                source.platform,
+                str(context.get("candidate_final") or ""),
+            )
+            context.update(merged_telemetry)
+            context.update({
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "chat_id": source.chat_id or "",
+                "thread_id": str(getattr(source, "thread_id", None) or ""),
+                "chat_type": getattr(source, "chat_type", "") or "",
+                "message_id": str(event_message_id or ""),
+                "source_id": ":".join(filter(None, (
+                    source.platform.value if source.platform else "",
+                    str(source.chat_id or ""),
+                    str(getattr(source, "thread_id", None) or ""),
+                    str(event_message_id or ""),
+                ))),
+                "session_key": session_key or "",
+                "run_generation": run_generation,
+                "attempt": pre_delivery_attempt,
+                "max_continuations": MAX_PRE_DELIVERY_CONTINUATIONS,
+                "empty_count": pre_delivery_empty_count
+                + (1 if context.get("is_empty") else 0),
+                # The finalizer supplies the untruncated original text.
+                "message": context.get("original_message"),
+            })
+
+            async def _evaluate() -> dict:
+                results = await _hooks_ref.emit_collect(
+                    "agent:pre_delivery",
+                    context,
+                    raise_exceptions=True,
+                    exact_only=True,
+                    run_sync_in_executor=True,
+                )
+                decision = reduce_decisions(results, allow_empty=True)
+                return enforce_continuation_budget(
+                    decision, pre_delivery_attempt
+                )
+
+            future = asyncio.run_coroutine_threadsafe(_evaluate(), _loop_for_step)
+            return wait_for_authority_future(
+                future, PRE_DELIVERY_HOOK_TIMEOUT_SECONDS
+            )
+
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
             if not _run_still_current():
                 return
@@ -17985,8 +18166,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            # A decision hook must see the complete candidate before any
+            # assistant text escapes. Tool/status progress remains available.
+            from agent.pre_delivery import resolve_delivery_modes
+            _want_stream_deltas, _want_interim_messages = resolve_delivery_modes(
+                _pre_delivery_enabled,
+                _streaming_enabled,
+                interim_assistant_messages_enabled,
+            )
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
@@ -18285,6 +18472,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+            agent.pre_delivery_callback = (
+                _pre_delivery_callback_sync if _pre_delivery_enabled else None
+            )
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).
             # Messaging has no persistent status bar, so each notice is a
@@ -18856,6 +19046,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            _pre_delivery_decision = result.get("pre_delivery_decision")
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -18970,7 +19161,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 0 if (_session_was_split or _compacted_in_place) else len(agent_history)
             )
 
-            if not final_response:
+            if result.get("pre_delivery_continue"):
+                return {
+                    **result,
+                    "messages": result.get("messages", []),
+                    "tools": tools_holder[0] or [],
+                    "history_offset": _effective_history_offset,
+                    "compacted_in_place": _compacted_in_place,
+                    "session_id": effective_session_id,
+                    "last_prompt_tokens": _last_prompt_toks,
+                    "input_tokens": _input_toks,
+                    "output_tokens": _output_toks,
+                    "model": _resolved_model,
+                    "provider": getattr(_agent, "provider", None) if _agent else None,
+                    "api_mode": getattr(_agent, "api_mode", None) if _agent else None,
+                    "base_url": getattr(_agent, "base_url", None) if _agent else None,
+                    "context_length": _context_length,
+                }
+
+            if not final_response and _pre_delivery_decision is None:
                 final_response = _normalize_empty_agent_response(
                     result, final_response or "", history_len=len(agent_history),
                 )
@@ -18996,7 +19205,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "provider": getattr(_agent, "provider", None) if _agent else None,
+                    "api_mode": getattr(_agent, "api_mode", None) if _agent else None,
+                    "base_url": getattr(_agent, "base_url", None) if _agent else None,
                     "context_length": _context_length,
+                    "pre_delivery_decision": result.get("pre_delivery_decision"),
+                    "pre_delivery_context": result.get("pre_delivery_context"),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -19019,7 +19233,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
+            if _pre_delivery_decision is None and "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
                     history_offset=len(agent_history),
@@ -19102,10 +19316,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": getattr(_agent, "provider", None) if _agent else None,
+                "api_mode": getattr(_agent, "api_mode", None) if _agent else None,
+                "base_url": getattr(_agent, "base_url", None) if _agent else None,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "pre_delivery_decision": result.get("pre_delivery_decision"),
+                "pre_delivery_context": result.get("pre_delivery_context"),
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default
