@@ -13,10 +13,13 @@ Events:
   - session:reset       -- Session reset completed (new session entry created)
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
+  - agent:pre_delivery  -- Decision gate before turn success persistence/delivery
   - agent:end           -- Agent finishes processing
   - command:*           -- Any slash command executed (wildcard match)
 
-Errors in hooks are caught and logged but never block the main pipeline.
+Errors in advisory hooks are caught and logged but never block the main
+pipeline. ``agent:pre_delivery`` is an authority hook: when registered, an
+exception, missing decision, or malformed decision fails closed.
 
 Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   platform     -- source platform name (e.g. "telegram", "matrix", "slack")
@@ -30,6 +33,17 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
 
 ``agent:end`` adds:
   response     -- agent response text (truncated to 500 chars)
+
+``agent:pre_delivery`` receives untruncated ``candidate_final``,
+``raw_candidate_final``, and ``original_message`` plus source/message/session
+ids, model/provider/API metadata, attempt/empty counters, failure state, and
+the current turn's complete ``tool_calls`` / ``tool_results`` with counts.
+Handlers return a mapping with ``decision`` set to ``allow``, ``rewrite``,
+``continue``, or ``block``. ``rewrite``/``block`` may provide ``response``;
+``continue`` may provide ``continuation_prompt``. Only one continuation is
+permitted. The hook runs before trajectory/session success persistence, and
+registered handlers force buffered assistant delivery so streaming cannot
+bypass the decision.
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``
@@ -172,6 +186,10 @@ class HookRegistry:
             handlers.extend(self._handlers.get(wildcard_key, []))
         return handlers
 
+    def has_handlers(self, event_type: str) -> bool:
+        """Return whether an event has any exact or wildcard handlers."""
+        return bool(self._resolve_handlers(event_type))
+
     async def emit(self, event_type: str, context: Optional[Dict[str, Any]] = None) -> None:
         """
         Fire all handlers registered for an event, discarding return values.
@@ -201,6 +219,8 @@ class HookRegistry:
         self,
         event_type: str,
         context: Optional[Dict[str, Any]] = None,
+        *,
+        raise_exceptions: bool = False,
     ) -> List[Any]:
         """Fire handlers and return their non-None return values in order.
 
@@ -223,5 +243,7 @@ class HookRegistry:
                 if result is not None:
                     results.append(result)
             except Exception as e:
+                if raise_exceptions:
+                    raise
                 print(f"[hooks] Error in handler for '{event_type}': {e}", flush=True)
         return results

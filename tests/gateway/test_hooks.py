@@ -314,3 +314,24 @@ class TestEmitCollect:
         await reg.emit_collect("agent:start")  # no context arg
 
         assert captured == [("agent:start", {})]
+
+    def test_has_handlers_includes_wildcards(self):
+        reg = HookRegistry()
+        reg._handlers["agent:*"] = [lambda _e, _c: None]
+
+        assert reg.has_handlers("agent:pre_delivery") is True
+        assert reg.has_handlers("command:status") is False
+
+    @pytest.mark.asyncio
+    async def test_collect_can_surface_handler_exception_for_authority_hook(self):
+        reg = HookRegistry()
+
+        def _raises(_event_type, _context):
+            raise RuntimeError("validator unavailable")
+
+        reg._handlers["agent:pre_delivery"] = [_raises]
+
+        with pytest.raises(RuntimeError, match="validator unavailable"):
+            await reg.emit_collect(
+                "agent:pre_delivery", {}, raise_exceptions=True
+            )

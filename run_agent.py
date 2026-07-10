@@ -485,6 +485,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        pre_delivery_callback: Optional[Callable[[dict], dict]] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -533,6 +534,7 @@ class AIAgent:
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
             event_callback=event_callback,
+            pre_delivery_callback=pre_delivery_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
             service_tier=service_tier,

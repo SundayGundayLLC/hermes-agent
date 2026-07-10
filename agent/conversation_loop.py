@@ -5025,7 +5025,13 @@ def run_conversation(
                     agent._flush_status_buffer()
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
-                    agent._drop_trailing_empty_response_scaffolding(messages)
+                    # A registered pre-delivery gate needs the complete tool
+                    # tail to decide whether an empty candidate may continue.
+                    # The finalizer removes/relabels the terminal sentinel
+                    # atomically after that decision.  Legacy callers keep the
+                    # existing eager cleanup behavior.
+                    if not getattr(agent, "pre_delivery_callback", None):
+                        agent._drop_trailing_empty_response_scaffolding(messages)
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     assistant_msg["content"] = "(empty)"
                     # This is a user-facing failure sentinel for the gateway,
