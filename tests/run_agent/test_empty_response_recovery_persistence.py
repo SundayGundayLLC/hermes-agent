@@ -15,6 +15,11 @@ class _CapturingSessionDB:
         return len(self.rows)
 
 
+class _FailingSessionDB(_CapturingSessionDB):
+    def append_message(self, session_id, role, content=None, **kwargs):
+        raise OSError("database is read-only")
+
+
 def _agent_with_capturing_db():
     agent = AIAgent.__new__(AIAgent)
     agent._persist_user_message_idx = None
@@ -212,3 +217,18 @@ def test_pre_delivery_recovery_prefix_matches_json_log_and_sqlite_surfaces():
     ]
     assert agent._session_db.rows[1]["content"] == REJECTED_CANDIDATE_PLACEHOLDER
     assert agent._session_db.rows[-1]["content"] == "Verified final proof."
+
+
+def test_persist_session_reports_failed_db_append_explicitly():
+    agent = _agent_with_capturing_db()
+    agent._session_db = _FailingSessionDB()
+    agent._save_session_log = lambda _messages: None
+    messages = [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": REJECTED_CANDIDATE_PLACEHOLDER},
+    ]
+
+    persisted = AIAgent._persist_session(agent, messages, conversation_history=[])
+
+    assert persisted is False
+    assert not any(message.get("_db_persisted") for message in messages)

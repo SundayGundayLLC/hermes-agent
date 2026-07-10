@@ -283,28 +283,32 @@ def finalize_turn(
                 and messages[-1].get("_empty_terminal_sentinel")
             ):
                 messages.pop()
-            if messages and messages[-1].get("role") != "assistant":
-                messages.append({
-                    "role": "assistant",
-                    "content": REJECTED_CANDIDATE_PLACEHOLDER,
-                    "_pre_delivery_rejected": True,
-                })
-            elif messages and messages[-1].get("role") == "assistant":
-                messages[-1]["content"] = REJECTED_CANDIDATE_PLACEHOLDER
-                messages[-1]["_pre_delivery_rejected"] = True
-                for _private_key in (
-                    "reasoning",
-                    "reasoning_content",
-                    "reasoning_details",
-                ):
-                    messages[-1].pop(_private_key, None)
+            _safe_rejected_message = {
+                "role": "assistant",
+                "content": REJECTED_CANDIDATE_PLACEHOLDER,
+                "_pre_delivery_rejected": True,
+                "pre_delivery_status": "rejected_nonterminal",
+            }
+            if messages and messages[-1].get("role") == "assistant":
+                # Rebuild from an allowlist instead of deleting known fields.
+                # Provider adapters may add new replay/raw payload keys over
+                # time; none may survive into a rejected durable placeholder.
+                messages[-1] = _safe_rejected_message
+            else:
+                messages.append(_safe_rejected_message)
 
             # The returned history is passed as conversation_history to the
             # bounded recovery run. Persist that exact safe chain now, after
             # the continue decision, so JSONL and SQLite agree on which prefix
             # is durable. The rejected candidate text itself is never stored.
             try:
-                agent._persist_session(messages, conversation_history)
+                _persisted = agent._persist_session(
+                    messages, conversation_history
+                )
+                if _persisted is not True:
+                    raise RuntimeError(
+                        "session store did not confirm placeholder persistence"
+                    )
             except Exception as _continue_persist_err:
                 logger.error(
                     "pre-delivery continuation persistence failed closed: %s",

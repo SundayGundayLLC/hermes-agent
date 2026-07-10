@@ -1,5 +1,8 @@
 """Tests for gateway/hooks.py — event hook system."""
 
+import asyncio
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -321,6 +324,53 @@ class TestEmitCollect:
 
         assert reg.has_handlers("agent:pre_delivery") is True
         assert reg.has_handlers("command:status") is False
+
+    def test_authority_handler_must_be_exact_not_wildcard(self):
+        reg = HookRegistry()
+        reg._handlers["agent:*"] = [lambda _e, _c: {"decision": "block"}]
+
+        assert reg.has_handlers("agent:pre_delivery") is True
+        assert reg.has_exact_handlers("agent:pre_delivery") is False
+
+    @pytest.mark.asyncio
+    async def test_exact_collection_excludes_legacy_wildcard_observers(self):
+        reg = HookRegistry()
+        reg._handlers["agent:*"] = [lambda _e, _c: {"decision": "block"}]
+        reg._handlers["agent:pre_delivery"] = [
+            lambda _e, _c: {"decision": "allow"}
+        ]
+
+        results = await reg.emit_collect(
+            "agent:pre_delivery", {}, exact_only=True
+        )
+
+        assert results == [{"decision": "allow"}]
+
+    @pytest.mark.asyncio
+    async def test_authority_sync_handler_runs_off_event_loop(self):
+        reg = HookRegistry()
+        started = threading.Event()
+        release = threading.Event()
+
+        def _blocking(_event_type, _context):
+            started.set()
+            release.wait(timeout=1.0)
+            return {"decision": "allow"}
+
+        reg._handlers["agent:pre_delivery"] = [_blocking]
+        before = time.monotonic()
+        task = asyncio.create_task(reg.emit_collect(
+            "agent:pre_delivery",
+            {},
+            exact_only=True,
+            run_sync_in_executor=True,
+        ))
+        await asyncio.sleep(0.02)
+        elapsed = time.monotonic() - before
+        assert started.is_set()
+        assert elapsed < 0.25
+        release.set()
+        assert await task == [{"decision": "allow"}]
 
     @pytest.mark.asyncio
     async def test_collect_can_surface_handler_exception_for_authority_hook(self):

@@ -11838,11 +11838,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "response": (response or "")[:500],
             }
             if agent_result.get("pre_delivery_decision") is not None:
-                _agent_end_ctx["pre_delivery_decision"] = agent_result.get(
-                    "pre_delivery_decision"
-                )
-                _agent_end_ctx["pre_delivery_context"] = agent_result.get(
-                    "pre_delivery_context"
+                from agent.pre_delivery import compact_decision_summary
+                _agent_end_ctx["pre_delivery_decision"] = compact_decision_summary(
+                    agent_result.get("pre_delivery_decision") or {},
+                    agent_result.get("pre_delivery_context") or {},
                 )
             await self.hooks.emit("agent:end", _agent_end_ctx)
             
@@ -17041,7 +17040,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
-        _pre_delivery_enabled = self.hooks.has_handlers("agent:pre_delivery")
+        _pre_delivery_enabled = self.hooks.has_exact_handlers(
+            "agent:pre_delivery"
+        )
         if self._get_proxy_url() and _pre_delivery_enabled:
             from agent.pre_delivery import DEGRADED_RESPONSE
             return {
@@ -17921,9 +17922,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             """Bridge the agent's atomic sync seam to async gateway hooks."""
             from agent.pre_delivery import (
                 MAX_PRE_DELIVERY_CONTINUATIONS,
+                PRE_DELIVERY_HOOK_TIMEOUT_SECONDS,
                 enforce_continuation_budget,
                 merge_tool_telemetry,
                 reduce_decisions,
+                wait_for_authority_future,
             )
 
             current_telemetry = {
@@ -17972,14 +17975,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "agent:pre_delivery",
                     context,
                     raise_exceptions=True,
+                    exact_only=True,
+                    run_sync_in_executor=True,
                 )
-                decision = reduce_decisions(results)
+                decision = reduce_decisions(results, allow_empty=True)
                 return enforce_continuation_budget(
                     decision, pre_delivery_attempt
                 )
 
             future = asyncio.run_coroutine_threadsafe(_evaluate(), _loop_for_step)
-            return future.result(timeout=30.0)
+            return wait_for_authority_future(
+                future, PRE_DELIVERY_HOOK_TIMEOUT_SECONDS
+            )
 
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
             if not _run_still_current():

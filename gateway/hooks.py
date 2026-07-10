@@ -19,7 +19,9 @@ Events:
 
 Errors in advisory hooks are caught and logged but never block the main
 pipeline. ``agent:pre_delivery`` is an authority hook: when registered, an
-exception, missing decision, or malformed decision fails closed.
+exception or malformed decision fails closed; ``None`` is an observer-only
+abstention. Only exact ``agent:pre_delivery`` registrations activate the gate
+(``agent:*`` remains advisory).
 
 Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   platform     -- source platform name (e.g. "telegram", "matrix", "slack")
@@ -52,6 +54,7 @@ and ``thread_id`` is non-empty.
 
 import asyncio
 import importlib.util
+import inspect
 import sys
 from typing import Any, Callable, Dict, List, Optional
 
@@ -173,14 +176,16 @@ class HookRegistry:
             except Exception as e:
                 print(f"[hooks] Error loading hook {hook_dir.name}: {e}", flush=True)
 
-    def _resolve_handlers(self, event_type: str) -> List[Callable]:
+    def _resolve_handlers(
+        self, event_type: str, *, include_wildcards: bool = True
+    ) -> List[Callable]:
         """Return all handlers that should fire for ``event_type``.
 
         Exact matches fire first, followed by wildcard matches (e.g.
         ``command:*`` matches ``command:reset``).
         """
         handlers = list(self._handlers.get(event_type, []))
-        if ":" in event_type:
+        if include_wildcards and ":" in event_type:
             base = event_type.split(":")[0]
             wildcard_key = f"{base}:*"
             handlers.extend(self._handlers.get(wildcard_key, []))
@@ -189,6 +194,10 @@ class HookRegistry:
     def has_handlers(self, event_type: str) -> bool:
         """Return whether an event has any exact or wildcard handlers."""
         return bool(self._resolve_handlers(event_type))
+
+    def has_exact_handlers(self, event_type: str) -> bool:
+        """Return whether an event has explicitly registered handlers."""
+        return bool(self._resolve_handlers(event_type, include_wildcards=False))
 
     async def emit(self, event_type: str, context: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -221,6 +230,8 @@ class HookRegistry:
         context: Optional[Dict[str, Any]] = None,
         *,
         raise_exceptions: bool = False,
+        exact_only: bool = False,
+        run_sync_in_executor: bool = False,
     ) -> List[Any]:
         """Fire handlers and return their non-None return values in order.
 
@@ -235,10 +246,15 @@ class HookRegistry:
             context = {}
 
         results: List[Any] = []
-        for fn in self._resolve_handlers(event_type):
+        for fn in self._resolve_handlers(
+            event_type, include_wildcards=not exact_only
+        ):
             try:
-                result = fn(event_type, context)
-                if asyncio.iscoroutine(result):
+                if run_sync_in_executor and not inspect.iscoroutinefunction(fn):
+                    result = await asyncio.to_thread(fn, event_type, context)
+                else:
+                    result = fn(event_type, context)
+                if inspect.isawaitable(result):
                     result = await result
                 if result is not None:
                     results.append(result)

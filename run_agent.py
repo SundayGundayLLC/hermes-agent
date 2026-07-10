@@ -1675,7 +1675,11 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+    ) -> bool:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -1692,7 +1696,7 @@ class AIAgent:
         self._drop_trailing_empty_response_scaffolding(messages)
         self._session_messages = messages
         self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        return self._flush_messages_to_session_db(messages, conversation_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1752,7 +1756,11 @@ class AIAgent:
         from agent.agent_runtime_helpers import repair_message_sequence
         return repair_message_sequence(self, messages)
 
-    def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _flush_messages_to_session_db(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+    ) -> bool:
         """Persist any un-flushed messages to the SQLite session store.
 
         Deduplicates via an intrinsic ``_DB_PERSISTED_MARKER`` stamped on each
@@ -1777,9 +1785,9 @@ class AIAgent:
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
-            return
+            return False
         if not self._session_db:
-            return
+            return False
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -1910,8 +1918,10 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """

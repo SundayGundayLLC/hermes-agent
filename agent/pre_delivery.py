@@ -8,6 +8,7 @@ or block it.
 
 from __future__ import annotations
 
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Dict, Iterable, List, Mapping
 
 
@@ -26,6 +27,7 @@ DEGRADED_RESPONSE = (
 REJECTED_CANDIDATE_PLACEHOLDER = (
     "Candidate withheld by pre-delivery policy; recovery continuation required."
 )
+PRE_DELIVERY_HOOK_TIMEOUT_SECONDS = 30.0
 
 _VALID_DECISIONS = {"allow", "rewrite", "continue", "block"}
 _DECISION_PRIORITY = {"allow": 0, "rewrite": 1, "continue": 2, "block": 3}
@@ -65,10 +67,17 @@ def normalize_decision(value: Any) -> Dict[str, Any]:
     return result
 
 
-def reduce_decisions(values: Iterable[Any]) -> Dict[str, Any]:
+def reduce_decisions(
+    values: Iterable[Any], *, allow_empty: bool = False
+) -> Dict[str, Any]:
     """Reduce multiple hook results deterministically and conservatively."""
     normalized = [normalize_decision(value) for value in values]
     if not normalized:
+        if allow_empty:
+            return {
+                "decision": "allow",
+                "reason": "pre_delivery_observers_only",
+            }
         raise PreDeliveryDecisionError(
             "registered pre-delivery handlers returned no decision"
         )
@@ -76,6 +85,34 @@ def reduce_decisions(values: Iterable[Any]) -> Dict[str, Any]:
         enumerate(normalized),
         key=lambda item: (_DECISION_PRIORITY[item[1]["decision"]], -item[0]),
     )[1]
+
+
+def compact_decision_summary(
+    decision: Mapping[str, Any], context: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Return the allowlisted, non-sensitive payload exposed to ``agent:end``."""
+    summary = {
+        "decision": decision.get("decision"),
+        "reason": decision.get("reason"),
+        "attempt": context.get("attempt"),
+        "empty_count": context.get("empty_count", 0),
+        "tool_call_count": context.get("tool_call_count", 0),
+        "tool_result_count": context.get("tool_result_count", 0),
+    }
+    for key in ("proof_bundle_id", "proof_bundle_path"):
+        value = decision.get(key) or context.get(key)
+        if value:
+            summary[key] = value
+    return summary
+
+
+def wait_for_authority_future(future: Any, timeout: float) -> Any:
+    """Wait for an async authority decision and cancel it on timeout."""
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        future.cancel()
+        raise
 
 
 def enforce_continuation_budget(

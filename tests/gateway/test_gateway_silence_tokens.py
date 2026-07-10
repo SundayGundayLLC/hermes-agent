@@ -217,7 +217,16 @@ async def test_blocked_pre_delivery_text_is_final_authority(monkeypatch, tmp_pat
             "response": DEGRADED_RESPONSE,
             "reason": "pre_delivery_continuation_exhausted",
         },
-        "pre_delivery_context": {"attempt": 1, "tool_result_count": 1},
+        "pre_delivery_context": {
+            "attempt": 1,
+            "empty_count": 2,
+            "tool_call_count": 1,
+            "tool_result_count": 1,
+            "original_message": "private original request",
+            "candidate_final": "private rejected candidate",
+            "tool_calls": [{"arguments": "private arguments"}],
+            "tool_results": [{"content": "private tool output"}],
+        },
     })
 
     response = await runner._handle_message_with_agent(
@@ -231,4 +240,14 @@ async def test_blocked_pre_delivery_text_is_final_authority(monkeypatch, tmp_pat
     emitted = [call.args for call in runner.hooks.emit.await_args_list]
     assert emitted[-1][0] == "agent:end"
     assert emitted[-1][1]["response"] == DEGRADED_RESPONSE[:500]
-    assert emitted[-1][1]["pre_delivery_decision"]["decision"] == "block"
+    assert emitted[-1][1]["pre_delivery_decision"] == {
+        "decision": "block",
+        "reason": "pre_delivery_continuation_exhausted",
+        "attempt": 1,
+        "empty_count": 2,
+        "tool_call_count": 1,
+        "tool_result_count": 1,
+    }
+    assert "pre_delivery_context" not in emitted[-1][1]
+    assert "private original request" not in repr(emitted[-1][1])
+    assert "private arguments" not in repr(emitted[-1][1])

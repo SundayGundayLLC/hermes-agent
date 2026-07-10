@@ -41,6 +41,7 @@ class FakeAgent:
         self.pre_delivery_callback = None
         self.cleanup_calls = 0
         self.trajectory_calls = 0
+        self.persist_success = True
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -64,6 +65,7 @@ class FakeAgent:
         self.persisted_messages = list(messages)
         self.jsonl_messages = [dict(message) for message in messages]
         self.sqlite_messages = [dict(message) for message in messages]
+        return self.persist_success
 
     def _file_mutation_verifier_enabled(self):
         return False
@@ -337,6 +339,63 @@ def test_first_empty_candidate_gets_one_unpersisted_recovery(monkeypatch):
     )
     assert result["messages"][-1]["role"] == "assistant"
     assert result["messages"][-1]["_pre_delivery_rejected"] is True
+
+
+def test_rejected_placeholder_drops_all_provider_replay_payloads(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent.pre_delivery_callback = lambda _context: {
+        "decision": "continue",
+        "continuation_prompt": "Recover.",
+    }
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "unverified candidate",
+            "reasoning": "private reasoning",
+            "reasoning_content": "provider scratch",
+            "reasoning_details": [{"raw": "secret"}],
+            "codex_message_items": [{"type": "output_text", "text": "raw"}],
+            "codex_reasoning_items": [{"summary": "raw reasoning"}],
+            "provider_raw_response": {"secret": "payload"},
+            "arbitrary_future_replay_field": "must disappear",
+        },
+    ]
+
+    result = _finalize_with_gate(agent, messages, "unverified candidate")
+
+    assert result["pre_delivery_continue"] is True
+    assert result["messages"][-1] == {
+        "role": "assistant",
+        "content": REJECTED_CANDIDATE_PLACEHOLDER,
+        "_pre_delivery_rejected": True,
+        "pre_delivery_status": "rejected_nonterminal",
+    }
+    assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_unconfirmed_placeholder_persistence_fails_closed(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent.persist_success = False
+    agent.pre_delivery_callback = lambda _context: {
+        "decision": "continue",
+        "continuation_prompt": "Must not run.",
+    }
+    messages = [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": "unverified"},
+    ]
+
+    result = _finalize_with_gate(agent, messages, "unverified")
+
+    assert result["final_response"] == DEGRADED_RESPONSE
+    assert result["pre_delivery_decision"]["decision"] == "block"
+    assert result["pre_delivery_decision"]["reason"] == (
+        "pre_delivery_continuation_persist_failed"
+    )
+    assert "pre_delivery_continue" not in result
 
 
 def test_continue_and_final_share_one_jsonl_sqlite_chain(monkeypatch):
