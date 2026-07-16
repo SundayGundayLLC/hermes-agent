@@ -4811,6 +4811,16 @@ class BasePlatformAdapter(ABC):
         delivery_attempted = False
         delivery_succeeded = False
 
+        # Bind the current inbound Discord message to the final transport
+        # policy.  The binding stores only a random authorization token, never
+        # the message text, and is invalidated in ``finally`` so background
+        # tasks cannot inherit an earlier turn's explicit JSON exception.
+        _discord_egress_binding = None
+        if _platform_name(self.platform) == "discord":
+            from gateway.discord_egress import begin_discord_turn
+
+            _discord_egress_binding = begin_discord_turn(event.text)
+
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is None:
@@ -5345,6 +5355,11 @@ class BasePlatformAdapter(ABC):
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
+
+            if _discord_egress_binding is not None:
+                from gateway.discord_egress import end_discord_turn
+
+                end_discord_turn(_discord_egress_binding)
     
     def _cleanup_finished_session_task(
         self, session_key: str, interrupt_event: Optional[asyncio.Event]

@@ -11,6 +11,7 @@ Uses discord.py library for:
 
 import asyncio
 import hashlib
+import io
 import inspect
 import json
 import logging
@@ -105,6 +106,11 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.discord_egress import (
+    filter_discord_attachment,
+    filter_discord_text,
+    raw_json_allowed,
+)
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
 from utils import atomic_json_write, env_float, env_int
@@ -2004,6 +2010,10 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            # Final Discord transport boundary: every origin that reaches the
+            # adapter (agent finals, cron, provider/tool notices, background
+            # completions, and legacy routing) is filtered here.
+            content = filter_discord_text(content)
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -2113,6 +2123,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
 
+        content = filter_discord_text(content)
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
@@ -2165,6 +2176,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str = "",
         file: Any = None,
         files: Optional[list] = None,
+        json_sanitized: bool = False,
     ) -> SendResult:
         """Create a forum thread whose starter message carries file attachments.
 
@@ -2173,6 +2185,26 @@ class DiscordAdapter(BasePlatformAdapter):
         ForumChannel accepts the same file/files/content kwargs as
         ``channel.send``, creating the thread and starter message atomically.
         """
+        # Defense in depth for direct callers that bypass send_document().
+        attached = [file] if file is not None else list(files or [])
+        blocked_json_names = [
+            str(getattr(item, "filename", ""))
+            for item in attached
+            if str(getattr(item, "filename", "")).lower().endswith(".json")
+        ]
+        if blocked_json_names and (not raw_json_allowed() or not json_sanitized):
+            proof_lines = "\n".join(
+                f"Structured JSON attachment suppressed. Proof: {name}"
+                for name in blocked_json_names
+            )
+            safe_content = filter_discord_text(content) if content else ""
+            return await self._send_to_forum(
+                forum_channel,
+                "\n".join(part for part in (safe_content, proof_lines) if part),
+            )
+
+        content = filter_discord_text(content) if content else content
+
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
 
@@ -2241,6 +2273,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
+            content = filter_discord_text(content)
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -2440,6 +2473,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        decision = filter_discord_attachment(file_path, caption)
+        if not decision.allowed:
+            return await self.send(chat_id=chat_id, content=decision.replacement_text)
+        caption = filter_discord_text(caption) if caption else caption
+
         channel = self._client.get_channel(int(chat_id))
         if not channel:
             channel = await self._client.fetch_channel(int(chat_id))
@@ -2447,14 +2485,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
         filename = file_name or os.path.basename(file_path)
-        with open(file_path, "rb") as fh:
+        source = (
+            io.BytesIO(decision.sanitized_bytes)
+            if decision.sanitized_bytes is not None
+            else open(file_path, "rb")
+        )
+        with source as fh:
             file = discord.File(fh, filename=filename)
             if self._is_forum_parent(channel):
-                return await self._forum_post_file(
-                    channel,
-                    content=(caption or "").strip(),
-                    file=file,
-                )
+                forum_kwargs: Dict[str, Any] = {
+                    "content": (caption or "").strip(),
+                    "file": file,
+                }
+                if decision.sanitized_bytes is not None:
+                    forum_kwargs["json_sanitized"] = True
+                return await self._forum_post_file(channel, **forum_kwargs)
             msg = await channel.send(content=caption if caption else None, file=file)
         return SendResult(success=True, message_id=str(msg.id))
 
@@ -2558,7 +2603,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
 
                 # Use the first caption if any (Discord only has one message body for the group)
-                content = captions[0] if captions else None
+                content = filter_discord_text(captions[0]) if captions else None
                 logger.info(
                     "[%s] Sending %d image(s) as single Discord message (chunk %d/%d)",
                     self.name, len(files), chunk_idx + 1, len(chunks),
@@ -2616,6 +2661,8 @@ class DiscordAdapter(BasePlatformAdapter):
         """Send audio as a Discord file attachment."""
         try:
             import io
+
+            caption = filter_discord_text(caption) if caption else caption
 
             channel = self._client.get_channel(int(chat_id))
             if not channel:
@@ -3647,6 +3694,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        caption = filter_discord_text(caption) if caption else caption
+
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL during Discord send_image", self.name)
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
@@ -3725,6 +3774,8 @@ class DiscordAdapter(BasePlatformAdapter):
         """Send an animated GIF natively as a Discord file attachment."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+
+        caption = filter_discord_text(caption) if caption else caption
 
         if not is_safe_url(animation_url):
             logger.warning("[%s] Blocked unsafe animation URL during Discord send_animation", self.name)
@@ -7038,7 +7089,7 @@ def _define_discord_view_classes() -> None:
                     self.session_key, self.confirm_id, choice,
                 )
                 if result_text:
-                    await interaction.followup.send(result_text)
+                    await interaction.followup.send(filter_discord_text(result_text))
                 logger.info(
                     "Discord button resolved slash-confirm for session %s "
                     "(choice=%s, user=%s)",
@@ -7910,6 +7961,26 @@ async def _standalone_send(
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
 
     try:
+        message = filter_discord_text(message)
+        caption = filter_discord_text(caption) if caption else caption
+        filtered_media = []
+        sanitized_media: Dict[str, bytes] = {}
+        suppressed_media_notices = []
+        for media_item in media_files or []:
+            media_path = media_item[0]
+            decision = filter_discord_attachment(media_path, caption)
+            if decision.allowed:
+                filtered_media.append(media_item)
+                if decision.sanitized_bytes is not None:
+                    sanitized_media[media_path] = decision.sanitized_bytes
+            else:
+                suppressed_media_notices.append(decision.replacement_text)
+        media_files = filtered_media
+        if suppressed_media_notices:
+            message = "\n".join(
+                part for part in [message, *suppressed_media_notices] if part
+            )
+
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
@@ -7990,7 +8061,13 @@ async def _standalone_send(
 
                         try:
                             for idx, media_path in enumerate(valid_media):
-                                with open(media_path, "rb") as fh:
+                                payload = sanitized_media.get(media_path)
+                                source = (
+                                    io.BytesIO(payload)
+                                    if payload is not None
+                                    else open(media_path, "rb")
+                                )
+                                with source as fh:
                                     form.add_field(
                                         f"files[{idx}]",
                                         fh.read(),
@@ -8098,7 +8175,13 @@ async def _standalone_send(
                             content_type="application/json",
                         )
                         caption_pending = False
-                    with open(media_path, "rb") as f:
+                    payload = sanitized_media.get(media_path)
+                    source = (
+                        io.BytesIO(payload)
+                        if payload is not None
+                        else open(media_path, "rb")
+                    )
+                    with source as f:
                         form.add_field("files[0]", f, filename=filename)
                         async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
                             if resp.status not in {200, 201}:
