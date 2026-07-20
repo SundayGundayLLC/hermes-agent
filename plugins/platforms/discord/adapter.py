@@ -4983,11 +4983,11 @@ class DiscordAdapter(BasePlatformAdapter):
             keys.add(channel_name)
             keys.add(f"#{channel_name}")
 
-        parent_id = parent_channel_id or getattr(channel, "parent_id", None)
+        parent_id = parent_channel_id or self._get_parent_channel_id(channel)
         if parent_id:
             keys.add(str(parent_id))
 
-        parent_channel = getattr(channel, "parent", None)
+        parent_channel = getattr(channel, "parent", None) or getattr(channel, "category", None)
         parent_name = str(getattr(parent_channel, "name", "")).strip() if parent_channel else ""
         if parent_name:
             keys.add(parent_name)
@@ -5988,13 +5988,15 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
-        """Return the parent channel ID for a Discord thread-like channel, if present."""
-        parent = getattr(channel, "parent", None)
-        if parent is not None and getattr(parent, "id", None) is not None:
-            return str(parent.id)
-        parent_id = getattr(channel, "parent_id", None)
-        if parent_id is not None:
-            return str(parent_id)
+        """Return the parent thread/forum channel or text-channel category ID."""
+        for parent_attr in ("parent", "category"):
+            parent = getattr(channel, parent_attr, None)
+            if parent is not None and getattr(parent, "id", None) is not None:
+                return str(parent.id)
+        for parent_id_attr in ("parent_id", "category_id"):
+            parent_id = getattr(channel, parent_id_attr, None)
+            if parent_id is not None:
+                return str(parent_id)
         return None
 
     def _is_forum_parent(self, channel: Any) -> bool:
