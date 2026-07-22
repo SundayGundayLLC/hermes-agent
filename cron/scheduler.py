@@ -2905,7 +2905,7 @@ def run_job(
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
-        from hermes_cli.auth import AuthError
+        from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
         # F8 runtime backstop: never resolve a stored provider/base_url pair that
         # would ship a named provider's stored credential to an off-host endpoint
@@ -2928,8 +2928,23 @@ def run_job(
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
-            # Primary provider auth failed — try fallback chain before giving up.
-            logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
+            # Quota exhaustion is transported as AuthError for compatibility,
+            # but the credentials are still valid and re-auth cannot help.
+            # Preserve the configured fallback behavior while keeping the
+            # operator-facing diagnosis accurate.
+            if is_rate_limited_auth_error(auth_exc):
+                logger.warning(
+                    "Job '%s': primary provider quota/rate limit reached (%s), "
+                    "trying fallback",
+                    job_id,
+                    auth_exc,
+                )
+            else:
+                logger.warning(
+                    "Job '%s': primary auth failed (%s), trying fallback",
+                    job_id,
+                    auth_exc,
+                )
             fb_list = get_fallback_chain(_cfg)
             runtime = None
             for entry in fb_list:
