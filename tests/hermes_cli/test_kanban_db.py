@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -888,6 +889,159 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     # Plain non-zero exit is still a normal crash, not rate-limited.
     _kb._record_worker_exit(pid + 1, _exited_status(1))
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
+
+
+@pytest.mark.parametrize(
+    ("log_text", "category", "terminal"),
+    [
+        (
+            "Primary provider unavailable (provider=openai-codex; "
+            "class=quota_exhausted) — switching to fallback: gemini / "
+            "gemini-3-flash-preview\n"
+            "GeminiAPIError [HTTP 429] RESOURCE_EXHAUSTED\n"
+            "Quota exceeded for metric: generativelanguage.googleapis.com/"
+            "generate_content_paid_tier_2_input_token_count, limit: 3000000, "
+            "model: gemini-3-flash\n"
+            "Context: 42 msgs, ~100,884 tokens\n"
+            "Unknown tool 'terminal'",
+            "gemini_paid_tier_input_tokens_exhausted",
+            True,
+        ),
+        (
+            "switching to fallback: gemini / gemini-3-flash-preview\n"
+            "GeminiAPIError [HTTP 429] RESOURCE_EXHAUSTED\n"
+            "Quota exceeded for metric: generativelanguage.googleapis.com/"
+            "generate_content_paid_tier_2_request_count, limit: 1000, "
+            "model: gemini-3-flash",
+            "gemini_request_rate_limited",
+            False,
+        ),
+        (
+            "switching to fallback: gemini / gemini-3-flash-preview\n"
+            "GeminiAPIError [HTTP 404] NOT_FOUND: model is not available",
+            "fallback_model_mismatch",
+            True,
+        ),
+        (
+            "Primary provider unavailable (provider=openai-codex; "
+            "class=quota_exhausted)",
+            "primary_provider_quota_exhausted",
+            False,
+        ),
+        (
+            "HTTP 429 insufficient_quota: billing hard limit reached",
+            "owner_billing_gate",
+            True,
+        ),
+        (
+            "Unknown tool 'terminal' — sending error to model",
+            "toolset_mismatch",
+            True,
+        ),
+    ],
+)
+def test_worker_log_failure_evidence_distinguishes_capacity_classes(
+    log_text, category, terminal,
+):
+    evidence = kb._worker_log_failure_evidence(log_text)
+    assert evidence is not None
+    assert evidence["category"] == category
+    assert evidence["terminal"] is terminal
+    assert "http" not in evidence["error_text"].lower()
+
+
+def test_windows_unknown_exit_uses_log_evidence_and_stops_after_one_attempt(
+    kanban_home, monkeypatch,
+):
+    """A dead Windows worker must surface its real provider/tool blocker,
+    not ``pid N not alive``, and must not replay the same huge context."""
+    import hermes_cli.kanban_db as _kb
+
+    log_text = (
+        "Primary provider unavailable (provider=openai-codex; "
+        "class=quota_exhausted) — switching to fallback: gemini / "
+        "gemini-3-flash-preview\n"
+        "Unknown tool 'terminal'\n"
+        "GeminiAPIError [HTTP 429] RESOURCE_EXHAUSTED\n"
+        "Quota exceeded for metric: generativelanguage.googleapis.com/"
+        "generate_content_paid_tier_2_input_token_count, limit: 3000000, "
+        "model: gemini-3-flash\n"
+        "Context: 42 msgs, ~100,884 tokens"
+    )
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("unknown", None))
+    monkeypatch.setattr(_kb, "read_worker_log", lambda *_a, **_k: log_text)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="capacity proof", assignee="foreman")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (41848, f"{host}:worker", tid),
+        )
+        conn.commit()
+
+        assert tid in kb.detect_crashed_workers(conn)
+        assert tid in getattr(_kb.detect_crashed_workers, "_last_auto_blocked", [])
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        assert "gemini_paid_tier_input_tokens_exhausted" in task.last_failure_error
+        assert "primary=openai-codex/quota_exhausted" in task.last_failure_error
+        assert "context_tokens=100884" in task.last_failure_error
+        assert "missing_tool=terminal" in task.last_failure_error
+        assert "not alive" not in task.last_failure_error
+
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='provider_blocked' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["failure_class"] == "gemini_paid_tier_input_tokens_exhausted"
+        assert payload["quota_limit"] == 3000000
+        assert payload["missing_tool"] == "terminal"
+
+
+def test_unknown_exit_with_request_rate_limit_requeues_on_cooldown(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("unknown", None))
+    monkeypatch.setattr(
+        _kb,
+        "read_worker_log",
+        lambda *_a, **_k: (
+            "switching to fallback: gemini / gemini-3-flash-preview\n"
+            "GeminiAPIError [HTTP 429] RESOURCE_EXHAUSTED\n"
+            "Quota exceeded for metric: generativelanguage.googleapis.com/"
+            "generate_content_paid_tier_2_request_count, limit: 1000"
+        ),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="request throttle", assignee="foreman")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (41999, f"{host}:worker", tid),
+        )
+        conn.commit()
+
+        assert tid not in kb.detect_crashed_workers(conn)
+        assert tid in getattr(_kb.detect_crashed_workers, "_last_rate_limited", [])
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert "gemini_request_rate_limited" in task.last_failure_error
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(

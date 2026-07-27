@@ -5825,6 +5825,174 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
+def _worker_log_failure_evidence(log_text: Optional[str]) -> Optional[dict[str, Any]]:
+    """Extract bounded, operator-safe failure evidence from a worker log.
+
+    Windows cannot recover an exit code after the fire-and-forget ``Popen``
+    handle is released, so a dead worker previously collapsed to the opaque
+    ``pid N not alive`` diagnosis.  The worker log is the durable cross-platform
+    receipt.  This parser deliberately recognizes only stable provider/tool
+    markers and returns compact metadata -- never arbitrary log text, URLs,
+    prompts, credentials, or response bodies.
+
+    ``terminal`` means retrying the same card unchanged is unsafe or futile
+    (for example, a missing tool or a paid-tier input-token ceiling).  Ordinary
+    request throttling remains retryable and uses the existing cooldown path.
+    """
+    if not log_text:
+        return None
+
+    text = str(log_text)[-131072:]
+    lower = text.lower()
+
+    def _match(pattern: str, *, flags: int = re.IGNORECASE) -> Optional[str]:
+        found = re.search(pattern, text, flags)
+        return found.group(1).strip() if found else None
+
+    def _safe(value: Optional[str], limit: int = 96) -> Optional[str]:
+        if not value:
+            return None
+        cleaned = re.sub(r"[^A-Za-z0-9._:+/@-]+", "_", value.strip())
+        return cleaned[:limit] or None
+
+    primary_provider = _safe(
+        _match(r"Primary provider unavailable \(provider=([^;()]+);")
+    )
+    primary_class = _safe(
+        _match(r"Primary provider unavailable \(provider=[^;()]+;\s*class=([^)]+)\)")
+    )
+    fallback_match = re.search(
+        r"switching to fallback:\s*([^\s/]+)\s*/\s*([^\r\n]+)",
+        text,
+        re.IGNORECASE,
+    )
+    fallback_provider = _safe(fallback_match.group(1)) if fallback_match else None
+    fallback_model = _safe(fallback_match.group(2)) if fallback_match else None
+    tool = _safe(_match(r"Unknown tool\s+['\"]([^'\"]+)['\"]"))
+    context_tokens_raw = _match(r"Context:\s*\d+\s+msgs,\s*~?([\d,]+)\s+tokens")
+    context_tokens = (
+        int(context_tokens_raw.replace(",", ""))
+        if context_tokens_raw and context_tokens_raw.replace(",", "").isdigit()
+        else None
+    )
+    metric = _safe(
+        _match(r"Quota exceeded for metric:\s*(?:[A-Za-z0-9._-]+/)?([A-Za-z0-9._-]+)")
+    )
+    quota_limit_raw = _match(r"Quota exceeded for metric:[\s\S]{0,240}?limit:\s*(\d+)")
+    quota_limit = int(quota_limit_raw) if quota_limit_raw else None
+
+    if not primary_provider and (
+        "codex provider quota exhausted" in lower
+        or ("openai-codex" in lower and "codex_rate_limited" in lower)
+    ):
+        primary_provider = "openai-codex"
+        primary_class = "quota_exhausted"
+
+    owner_billing = any(
+        marker in lower
+        for marker in (
+            "insufficient_quota",
+            "billing_hard_limit_reached",
+            "billing hard limit",
+            "payment_required",
+        )
+    )
+    model_mismatch = bool(
+        re.search(
+            r"(?:404|not_found)[\s\S]{0,240}?model|"
+            r"model\s+[^\r\n]{0,120}?(?:not found|does not exist|not available|unsupported)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    gemini_exhausted = (
+        "resource_exhausted" in lower
+        and (fallback_provider == "gemini" or "geminiapierror" in lower)
+    )
+    paid_tier_input_tokens = bool(
+        metric and re.search(r"paid_tier_\d+_input_token_count$", metric)
+    )
+    input_token_quota = bool(metric and metric.endswith("input_token_count"))
+    request_quota = bool(
+        metric and ("request" in metric or metric.endswith("request_count"))
+    )
+
+    category: Optional[str] = None
+    terminal = False
+    event_kind = "provider_blocked"
+    if owner_billing:
+        category = "owner_billing_gate"
+        terminal = True
+    elif model_mismatch:
+        category = "fallback_model_mismatch"
+        terminal = True
+    elif paid_tier_input_tokens:
+        category = "gemini_paid_tier_input_tokens_exhausted"
+        terminal = True
+    elif gemini_exhausted and input_token_quota:
+        category = "gemini_input_tokens_exhausted"
+        terminal = True
+    elif tool:
+        category = "toolset_mismatch"
+        terminal = True
+        event_kind = "toolset_mismatch"
+    elif gemini_exhausted and (request_quota or not metric):
+        category = "gemini_request_rate_limited"
+    elif primary_class in {"quota_exhausted", "quota_or_rate_limit"}:
+        category = "primary_provider_quota_exhausted"
+    elif primary_provider and primary_class:
+        category = "primary_provider_auth_failed"
+        terminal = True
+
+    if category is None:
+        return None
+
+    details: dict[str, Any] = {
+        "failure_class": category,
+        "terminal": terminal,
+    }
+    for key, value in (
+        ("primary_provider", primary_provider),
+        ("primary_class", primary_class),
+        ("fallback_provider", fallback_provider),
+        ("fallback_model", fallback_model),
+        ("quota_metric", metric),
+        ("quota_limit", quota_limit),
+        ("context_tokens", context_tokens),
+        ("missing_tool", tool),
+    ):
+        if value is not None:
+            details[key] = value
+
+    parts = [f"worker_failure={category}"]
+    if primary_provider:
+        parts.append(
+            f"primary={primary_provider}/{primary_class or 'unavailable'}"
+        )
+    if fallback_provider:
+        parts.append(
+            f"fallback={fallback_provider}/{fallback_model or 'unknown'}"
+        )
+    if metric:
+        parts.append(f"metric={metric}")
+    if quota_limit is not None:
+        parts.append(f"limit={quota_limit}")
+    if context_tokens is not None:
+        parts.append(f"context_tokens={context_tokens}")
+    if tool:
+        parts.append(f"missing_tool={tool}")
+    parts.append(
+        "action=owner_or_profile_repair" if terminal else "action=retry_after_cooldown"
+    )
+    return {
+        "category": category,
+        "terminal": terminal,
+        "event_kind": event_kind,
+        "error_text": "; ".join(parts)[:500],
+        "details": details,
+    }
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
@@ -6378,8 +6546,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case so we can trip the breaker
     # immediately instead of incrementing by 1.
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, bool, dict[str, Any]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text,
+    #  force_trip, evidence_payload)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -6404,8 +6573,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            log_evidence = _worker_log_failure_evidence(
+                read_worker_log(row["id"], tail_bytes=131072)
+            )
             rate_limited_exit = False
-            if kind == "clean_exit":
+            force_trip = False
+            evidence_payload: dict[str, Any] = {}
+            if log_evidence and log_evidence["terminal"]:
+                # A durable worker-log receipt is more specific than the
+                # process-table result, especially on Windows where the
+                # abandoned Popen handle leaves no retrievable exit code.
+                # Stop after this single attempt: replaying a giant context
+                # against the same missing tool / token ceiling / bad model
+                # only burns more quota and hides the actionable diagnosis.
+                protocol_violation = False
+                force_trip = True
+                error_text = log_evidence["error_text"]
+                event_kind = log_evidence["event_kind"]
+                evidence_payload = dict(log_evidence["details"])
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    **evidence_payload,
+                }
+                if code is not None and kind != "unknown":
+                    event_payload["exit_kind"] = kind
+                    event_payload["exit_code"] = code
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Retrying won't
@@ -6421,7 +6615,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
-            elif kind == "rate_limited":
+            elif kind == "rate_limited" or (
+                log_evidence and not log_evidence["terminal"]
+            ):
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
                 # the task is fine, the account just hit a wall. Release it
@@ -6432,8 +6628,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 protocol_violation = False
                 rate_limited_exit = True
                 error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
+                    log_evidence["error_text"]
+                    if log_evidence
+                    else (
+                        f"pid {pid} exited rate-limited (quota wall) — "
+                        f"requeued without counting a failure"
+                    )
                 )
                 event_kind = "rate_limited"
                 event_payload = {
@@ -6441,6 +6641,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                if log_evidence:
+                    event_payload.update(log_evidence["details"])
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -6493,7 +6695,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, force_trip,
+                         evidence_payload)
                     )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
@@ -6509,10 +6712,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid, pid, claimer, protocol_violation, error_text,
+            force_trip, evidence_payload,
+        ) in crash_details:
+            if force_trip:
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    failure_limit=1,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "claimer": claimer,
+                        **evidence_payload,
+                    },
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
             fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation

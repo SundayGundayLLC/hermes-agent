@@ -48,8 +48,18 @@ class CLIAgentSetupMixin:
 
         # Primary provider auth failed — try fallback providers before giving up.
         if runtime is None and _primary_exc is not None:
-            from hermes_cli.auth import AuthError
+            from hermes_cli.auth import AuthError, is_rate_limited_auth_error
             if isinstance(_primary_exc, AuthError):
+                _primary_provider = (
+                    str(getattr(_primary_exc, "provider", "") or "").strip()
+                    or str(self.requested_provider or "unknown").strip()
+                    or "unknown"
+                )
+                _primary_failure_class = (
+                    "quota_exhausted"
+                    if is_rate_limited_auth_error(_primary_exc)
+                    else "auth_failed"
+                )
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
@@ -59,10 +69,17 @@ class CLIAgentSetupMixin:
                     try:
                         runtime = resolve_runtime_provider(requested=_fb_provider)
                         logger.warning(
-                            "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
-                            _primary_exc, _fb_provider, _fb_model,
+                            "Primary provider unavailable (provider=%s; class=%s). "
+                            "Falling through to fallback: %s/%s",
+                            _primary_provider, _primary_failure_class,
+                            _fb_provider, _fb_model,
                         )
-                        _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
+                        _cprint(
+                            "⚠️  Primary provider unavailable "
+                            f"(provider={_primary_provider}; "
+                            f"class={_primary_failure_class}) — switching to "
+                            f"fallback: {_fb_provider} / {_fb_model}"
+                        )
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
                         _primary_exc = None

@@ -427,6 +427,27 @@ hermes kanban create "Translate the docs site to French" \
 
 Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip it for cheap one-shot work — the per-turn judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures. The judge is only as good as your goal text, so write the body as **explicit acceptance criteria**.
 
+### Worker failure transparency
+
+The dispatcher reads a bounded tail of each dead worker's durable log before
+classifying the run. This matters on Windows, where a fire-and-forget worker's
+exit code may no longer be available and older releases reduced every failure
+to `pid N not alive`.
+
+- Ordinary provider request throttling is recorded as a typed rate-limit event
+  and retried only after the configured cooldown.
+- Missing worker tools, provider/model mismatches, owner billing gates, and
+  input-token quota ceilings stop after the first proven attempt. The card is
+  blocked with a compact receipt containing the provider, fallback model,
+  quota metric/limit, context-token count, and missing tool when available.
+- Worker logs and card receipts never copy prompts, response bodies, URLs, or
+  credentials into the structured failure metadata.
+
+The assigned profile's effective CLI toolsets are pinned into every fresh
+worker process. A worker therefore receives exactly the profile authority that
+the dispatcher resolved at spawn time; failure transparency does not widen a
+quota-degraded or otherwise restricted profile.
+
 ### How the orchestrator behaves
 
 A **well-behaved orchestrator does not do the work itself.** It decomposes the user's goal into tasks, links them, assigns each to one of the profiles you've set up, and steps back. The orchestrator guidance — anti-temptation rules, a Step-0 profile-discovery prompt (the dispatcher silently fails on unknown assignee names, so the orchestrator must ground every card in profiles that actually exist on your machine), and a decomposition playbook keyed on `kanban_create` / `kanban_link` / `kanban_comment` — is injected into the worker's system prompt automatically; there is nothing to install.
