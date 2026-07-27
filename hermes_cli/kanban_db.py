@@ -4538,6 +4538,101 @@ def edit_completed_task_result(
     return True
 
 
+def release_rate_limited_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_pid: Optional[int] = None,
+) -> bool:
+    """Release a provider-limited worker with its exact diagnosis intact.
+
+    This is the in-process counterpart to the exit-code sentinel handled by
+    :func:`detect_crashed_workers`.  Recording before process exit is required
+    on platforms such as Windows where an abandoned ``Popen`` handle cannot be
+    reaped later for its exit status.  Capacity failures do not increment the
+    task failure counter; the existing respawn guard applies its cooldown.
+    """
+    if expected_run_id is None or not expected_claim_lock or expected_worker_pid is None:
+        return False
+    payload = dict(metadata or {})
+    payload.setdefault("reason", reason)
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "last_failure_error = ? WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ? AND worker_pid = ?",
+            (
+                reason[:500], task_id, int(expected_run_id),
+                expected_claim_lock, int(expected_worker_pid),
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="rate_limited",
+            status="rate_limited",
+            error=reason,
+            metadata=payload,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "rate_limited",
+            payload,
+            run_id=run_id,
+        )
+    return True
+
+
+def block_worker_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    kind: str,
+    metadata: Optional[dict],
+    expected_run_id: int,
+    expected_claim_lock: str,
+    expected_worker_pid: int,
+) -> bool:
+    """Atomically block only the exact worker attempt reporting a failure."""
+    if kind not in {"needs_input", "capability"}:
+        raise ValueError("worker diagnostic block kind must be needs_input or capability")
+    payload = dict(metadata or {})
+    payload.update({"reason": reason, "kind": kind})
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, block_kind = ?, "
+            "last_failure_error = ? WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ? AND worker_pid = ?",
+            (
+                kind, reason[:500], task_id, int(expected_run_id),
+                expected_claim_lock, int(expected_worker_pid),
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            error=reason,
+            summary=reason,
+            metadata=payload,
+        )
+        _append_event(conn, task_id, "blocked", payload, run_id=run_id)
+    return True
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5757,6 +5852,39 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_recent_worker_returncodes: "dict[int, tuple[int, float]]" = {}
+_windows_worker_processes: "dict[int, Any]" = {}
+
+
+def _poll_windows_worker_exits() -> list[int]:
+    """Poll retained Windows child handles and record exact exit codes."""
+    reaped: list[int] = []
+    for pid, proc in list(_windows_worker_processes.items()):
+        try:
+            code = proc.poll()
+        except Exception:
+            continue
+        if code is None:
+            continue
+        _recent_worker_returncodes[int(pid)] = (int(code), time.time())
+        _windows_worker_processes.pop(pid, None)
+        reaped.append(pid)
+    now = time.time()
+    if len(_recent_worker_returncodes) > _RECENT_WORKER_EXITS_MAX // 2:
+        cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+        for old_pid in [
+            item_pid
+            for item_pid, (_code, recorded_at) in _recent_worker_returncodes.items()
+            if recorded_at < cutoff
+        ]:
+            _recent_worker_returncodes.pop(old_pid, None)
+    if len(_recent_worker_returncodes) > _RECENT_WORKER_EXITS_MAX:
+        ordered = sorted(
+            _recent_worker_returncodes.items(), key=lambda item: item[1][1]
+        )
+        for old_pid, _ in ordered[: len(ordered) // 2]:
+            _recent_worker_returncodes.pop(old_pid, None)
+    return reaped
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -5806,11 +5934,30 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
-    entry = _recent_worker_exits.get(int(pid))
+    direct = _recent_worker_returncodes.pop(int(pid), None)
+    if direct is not None:
+        _recent_worker_exits.pop(int(pid), None)
+        code = int(direct[0])
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
+    entry = _recent_worker_exits.pop(int(pid), None)
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
     try:
+        # Portable decode for the conventional wait-status encoding. Windows
+        # does not expose meaningful ``os.WIFEXITED`` semantics, but tests,
+        # sidecars, and the POSIX reaper all use ``exit_code << 8``.
+        if raw >= 0 and (raw & 0x7F) == 0:
+            code = (raw >> 8) & 0xFF
+            if code == 0:
+                return ("clean_exit", 0)
+            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", code)
+            return ("nonzero_exit", code)
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
             if code == 0:
@@ -5829,10 +5976,13 @@ def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    children (returns []). On Windows, retained ``Popen`` handles are polled
+    because PID liveness alone cannot recover a child's exit code.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    if os.name == "nt":
+        reaped.extend(_poll_windows_worker_exits())
+    else:
         try:
             while True:
                 try:
@@ -6371,6 +6521,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
     """
+    replay_worker_diagnostic_sidecars(conn)
     crashed: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
@@ -6538,6 +6689,79 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
+
+
+def replay_worker_diagnostic_sidecars(conn: sqlite3.Connection) -> list[str]:
+    """Replay exact worker diagnoses that could not be written in-process.
+
+    Sidecars are attempt-bound by task, run, claim lock, and PID. A stale
+    writer can therefore never mutate a newer claim. Successfully consumed or
+    proven-stale files are removed; transient DB failures remain for the next
+    dispatcher tick.
+    """
+    consumed: list[str] = []
+    log_dir = worker_logs_dir()
+    if not log_dir.exists():
+        return consumed
+    for path in list(log_dir.glob("*.diagnostic.json"))[:256]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            task_id = str(payload["task_id"])
+            run_id = int(payload["run_id"])
+            claim_lock = str(payload["claim_lock"])
+            worker_pid = int(payload["worker_pid"])
+            reason = str(payload["reason"])
+            diagnostic = dict(payload["diagnostic"])
+        except Exception:
+            path.unlink(missing_ok=True)
+            continue
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        exact = bool(
+            row
+            and row["status"] == "running"
+            and row["current_run_id"] == run_id
+            and row["claim_lock"] == claim_lock
+            and row["worker_pid"] == worker_pid
+        )
+        if not exact:
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            if diagnostic.get("disposition") == "release_with_cooldown":
+                handled = release_rate_limited_worker(
+                    conn,
+                    task_id,
+                    reason=reason,
+                    metadata=diagnostic,
+                    expected_run_id=run_id,
+                    expected_claim_lock=claim_lock,
+                    expected_worker_pid=worker_pid,
+                )
+            else:
+                kind = (
+                    "needs_input"
+                    if diagnostic.get("disposition") == "block_needs_input"
+                    else "capability"
+                )
+                handled = block_worker_failure(
+                    conn,
+                    task_id,
+                    reason=reason,
+                    kind=kind,
+                    metadata=diagnostic,
+                    expected_run_id=run_id,
+                    expected_claim_lock=claim_lock,
+                    expected_worker_pid=worker_pid,
+                )
+        except sqlite3.Error:
+            continue
+        if handled:
+            path.unlink(missing_ok=True)
+            consumed.append(task_id)
+    return consumed
 
 
 def _record_task_failure(
@@ -7655,7 +7879,7 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> list[str]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
     Dispatcher-spawned workers are launched from a long-lived gateway process,
@@ -7667,7 +7891,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     task-scoped kanban lifecycle tools when ``HERMES_KANBAN_TASK`` is set.
     """
     if not hermes_home:
-        return None
+        raise RuntimeError("kanban worker profile home is unavailable")
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
@@ -7679,14 +7903,14 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        if not toolsets:
+            raise RuntimeError("assigned profile resolved an empty CLI toolset")
+        return toolsets
     except Exception as exc:
-        _log.debug(
-            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
-            hermes_home,
-            exc,
-        )
-        return None
+        raise RuntimeError(
+            "kanban worker could not resolve assigned profile CLI toolsets "
+            f"for HERMES_HOME={hermes_home!r}: {exc}"
+        ) from exc
 
 
 def _default_spawn(
@@ -7797,6 +8021,10 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    env["HERMES_KANBAN_DIAGNOSTIC_PATH"] = str(
+        worker_logs_dir(board=board)
+        / f"{task.id}.{task.current_run_id or 'unknown'}.diagnostic.json"
+    )
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -7828,8 +8056,7 @@ def _default_spawn(
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
         "-q", prompt,
@@ -7858,16 +8085,14 @@ def _default_spawn(
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
     except FileNotFoundError:
-        log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    finally:
+        log_f.close()
+    if _IS_WINDOWS:
+        _windows_worker_processes[int(proc.pid)] = proc
     return proc.pid
 
 

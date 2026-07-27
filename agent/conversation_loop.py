@@ -2586,6 +2586,25 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    from hermes_cli.kanban_worker_diagnostics import (
+                        provider_failure_snapshot,
+                    )
+
+                    _provider_failures = getattr(
+                        agent, "_kanban_provider_failures", []
+                    )
+                    _provider_failures.append(
+                        provider_failure_snapshot(
+                            api_error,
+                            provider=getattr(agent, "provider", "") or "",
+                            model=getattr(agent, "model", "") or "",
+                            reason=classified.reason.value,
+                            status_code=status_code,
+                            fallback_stage=getattr(agent, "_fallback_index", 0),
+                        )
+                    )
+                    agent._kanban_provider_failures = _provider_failures[-8:]
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
@@ -3148,6 +3167,18 @@ def run_conversation(
                     FailoverReason.billing,
                     FailoverReason.upstream_rate_limit,
                 }
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    from hermes_cli.kanban_worker_diagnostics import (
+                        kanban_provider_retry_ceiling,
+                    )
+
+                    max_retries = kanban_provider_retry_ceiling(
+                        max_retries,
+                        is_provider_capacity_failure=is_rate_limited,
+                        has_pending_fallback=(
+                            agent._fallback_index < len(agent._fallback_chain)
+                        ),
+                    )
                 _is_transport_failure = classified.reason in {
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
@@ -3898,6 +3929,19 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        "failure_reason": classified.reason.value,
+                        "failure_provider": _provider,
+                        "failure_model": _model,
+                        "failure_status_code": status_code,
+                        "provider_failures": getattr(
+                            agent, "_kanban_provider_failures", []
+                        ),
+                        "failure_quota_marker": (
+                            getattr(agent, "_kanban_provider_failures", [{}])[-1]
+                            .get("quota_marker")
+                            if getattr(agent, "_kanban_provider_failures", [])
+                            else None
+                        ),
                     }
 
                 if retry_count >= max_retries:
@@ -4094,6 +4138,18 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        "failure_provider": _provider,
+                        "failure_model": _model,
+                        "failure_status_code": status_code,
+                        "provider_failures": getattr(
+                            agent, "_kanban_provider_failures", []
+                        ),
+                        "failure_quota_marker": (
+                            getattr(agent, "_kanban_provider_failures", [{}])[-1]
+                            .get("quota_marker")
+                            if getattr(agent, "_kanban_provider_failures", [])
+                            else None
+                        ),
                     }
 
                 # For rate limits, respect the Retry-After header if present
@@ -4451,6 +4507,42 @@ def run_conversation(
                     invalid_name = invalid_tool_calls[0]
                     invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
                     agent._buffer_vprint(f"⚠️  Unknown tool '{invalid_preview}' — sending error to model for agent-correction ({agent._invalid_tool_retries}/3)")
+
+                    _known_but_disabled_tool = False
+                    if os.environ.get("HERMES_KANBAN_TASK") and invalid_preview.strip():
+                        try:
+                            from hermes_cli.kanban_worker_diagnostics import (
+                                is_known_disabled_tool,
+                            )
+
+                            _known_but_disabled_tool = is_known_disabled_tool(
+                                invalid_name,
+                                agent.valid_tool_names,
+                            )
+                        except Exception:
+                            _known_but_disabled_tool = False
+
+                    if _known_but_disabled_tool:
+                        agent._flush_status_buffer()
+                        _final_response = (
+                            f"Kanban worker toolset mismatch: requested "
+                            f"'{invalid_preview}' is unavailable in the assigned "
+                            "profile's effective CLI toolset."
+                        )
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _final_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _final_response,
+                            "failure_reason": "toolset_mismatch",
+                            "failure_provider": str(getattr(agent, "provider", "") or ""),
+                            "failure_model": str(getattr(agent, "model", "") or ""),
+                            "requested_tool": invalid_preview,
+                            "available_tools": sorted(agent.valid_tool_names),
+                        }
 
                     if agent._invalid_tool_retries >= 3:
                         agent._flush_status_buffer()
