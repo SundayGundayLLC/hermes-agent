@@ -21,6 +21,12 @@ _MODEL_MISMATCH_RE = re.compile(
     r"unknown model|invalid model)",
     re.IGNORECASE,
 )
+_RETRY_AFTER_RE = re.compile(r"\bretry\s+after\s+(\d{1,9})\s*(?:s|sec(?:ond)?s?)?\b", re.IGNORECASE)
+_AUTH_INVALID_RE = re.compile(
+    r"\b(?:invalid|expired|revoked)\s+(?:credentials?|token|api[ _-]?key)|"
+    r"\b(?:authentication|auth(?:orization)?)\s+(?:failed|required)\b",
+    re.IGNORECASE,
+)
 
 
 def provider_failure_snapshot(
@@ -176,6 +182,8 @@ def classify_worker_failure(
     status = result.get("failure_status_code")
     error = str(result.get("error") or result.get("final_response") or "")
     lowered = error.lower()
+    retry_match = _RETRY_AFTER_RE.search(error)
+    retry_after_seconds = int(retry_match.group(1)) if retry_match else None
 
     diagnostic: dict[str, Any] = {
         "profile": (profile or "unknown").strip().lower(),
@@ -185,6 +193,9 @@ def classify_worker_failure(
         "primary_failure": dict(primary_failure) if primary_failure else None,
         "provider_failures": list(result.get("provider_failures") or []),
     }
+    if retry_after_seconds is not None:
+        # This is provider-supplied scheduling metadata, not the provider body.
+        diagnostic["retry_after_seconds"] = retry_after_seconds
     if not diagnostic["primary_failure"] and len(diagnostic["provider_failures"]) > 1:
         diagnostic["primary_failure"] = dict(diagnostic["provider_failures"][0])
 
@@ -219,6 +230,17 @@ def classify_worker_failure(
         )
         return diagnostic
 
+    # Credential-invalid signals take precedence over a provider's HTTP
+    # status.  Some auth front doors use 429 as a defensive response; never
+    # turn an explicit invalid-credential message into a harmless cooldown.
+    if reason in {"auth", "authentication"} or _AUTH_INVALID_RE.search(error):
+        diagnostic.update(
+            category="provider_auth_failed",
+            disposition="block_needs_input",
+            credentials_state="invalid",
+        )
+        return diagnostic
+
     if current_provider == "gemini" and (
         quota_marker == "paid_tier_input_token" or
         ("paid_tier" in lowered and "input_token" in lowered)
@@ -240,17 +262,24 @@ def classify_worker_failure(
         )
         return diagnostic
 
+    if current_provider == "openai-codex" and (
+        reason in {"rate_limit", "upstream_rate_limit"}
+        or status == 429
+        or "codex provider quota exhausted" in lowered
+        or "usage limit" in lowered
+    ):
+        diagnostic.update(
+            category="codex_provider_capacity",
+            disposition="release_with_cooldown",
+            credentials_state="valid",
+        )
+        return diagnostic
+
     if reason in {"rate_limit", "upstream_rate_limit"} or status == 429:
         diagnostic.update(
             category="provider_rate_limited",
             disposition="release_with_cooldown",
-        )
-        return diagnostic
-
-    if reason in {"auth", "authentication"}:
-        diagnostic.update(
-            category="provider_auth_failed",
-            disposition="block_needs_input",
+            credentials_state="unknown",
         )
         return diagnostic
 
@@ -266,6 +295,10 @@ def _format_reason(diagnostic: dict[str, Any]) -> str:
     ]
     if diagnostic.get("http_status") is not None:
         parts.append(f"http={diagnostic['http_status']}")
+    if diagnostic.get("credentials_state"):
+        parts.append(f"credentials={diagnostic['credentials_state']}")
+    if diagnostic.get("retry_after_seconds") is not None:
+        parts.append(f"retry_after_seconds={diagnostic['retry_after_seconds']}")
     if diagnostic.get("requested_tool"):
         parts.append(f"requested_tool={diagnostic['requested_tool']}")
     primary = diagnostic.get("primary_failure")

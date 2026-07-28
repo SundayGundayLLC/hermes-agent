@@ -197,6 +197,61 @@ def test_primary_codex_quota_is_preserved_with_fallback() -> None:
     assert len(terminal["provider_failures"]) == 2
 
 
+def test_codex_quota_terminal_reason_keeps_retry_and_valid_credentials() -> None:
+    diagnostic = classify_worker_failure(
+        {
+            "failed": True,
+            "failure_reason": "rate_limit",
+            "failure_status_code": 429,
+            "error": "Codex provider quota exhausted (429); retry after 44479s. Credentials are still valid.",
+        },
+        provider="openai-codex",
+        model="gpt-5.6-terra",
+        profile="foreman",
+    )
+    assert diagnostic is not None
+    assert diagnostic["category"] == "codex_provider_capacity"
+    assert diagnostic["credentials_state"] == "valid"
+    assert diagnostic["retry_after_seconds"] == 44479
+    assert diagnostic["disposition"] == "release_with_cooldown"
+
+
+def test_invalid_credentials_are_not_reported_as_capacity() -> None:
+    diagnostic = classify_worker_failure(
+        {
+            "failed": True,
+            "failure_reason": "unknown",
+            "failure_status_code": 401,
+            "error": "Authentication failed: invalid credentials",
+        },
+        provider="openai-codex",
+        model="gpt-5.6-terra",
+        profile="foreman",
+    )
+    assert diagnostic is not None
+    assert diagnostic["category"] == "provider_auth_failed"
+    assert diagnostic["credentials_state"] == "invalid"
+    assert diagnostic["disposition"] == "block_needs_input"
+
+
+def test_invalid_credentials_override_a_429_capacity_status() -> None:
+    diagnostic = classify_worker_failure(
+        {
+            "failed": True,
+            "failure_reason": "auth",
+            "failure_status_code": 429,
+            "error": "Authentication failed: invalid credentials; retry after 30s.",
+        },
+        provider="openai-codex",
+        model="gpt-5.6-terra",
+        profile="foreman",
+    )
+    assert diagnostic is not None
+    assert diagnostic["category"] == "provider_auth_failed"
+    assert diagnostic["credentials_state"] == "invalid"
+    assert diagnostic["disposition"] == "block_needs_input"
+
+
 def test_rate_limit_release_is_exact_attempt_bound(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -229,6 +284,37 @@ def test_rate_limit_release_is_exact_attempt_bound(
         ).fetchone()
         assert run["outcome"] == "rate_limited"
         assert json.loads(run["metadata"])["category"] == "gemini_request_rate_limited"
+
+
+def test_codex_quota_canary_persists_typed_run_and_event(kanban_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker_pid = os.getpid()
+    with kb.connect_closing() as conn:
+        task_id, run_id, claim_lock = _claimed_attempt(conn, worker_pid=worker_pid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+    monkeypatch.setenv("HERMES_PROFILE", "foreman")
+    cli = SimpleNamespace(provider="openai-codex", model="gpt-5.6-terra", _kanban_primary_provider_failure=None)
+    result = {
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "failure_status_code": 429,
+        "error": "Codex provider quota exhausted (429); retry after 44479s. Credentials are still valid.",
+    }
+    assert record_kanban_worker_failure(cli, result)
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        run = conn.execute("SELECT outcome, error, metadata FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        event = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    metadata = json.loads(run["metadata"])
+    assert run["outcome"] == "rate_limited"
+    assert "credentials=valid" in run["error"]
+    assert "retry_after_seconds=44479" in run["error"]
+    assert metadata["category"] == "codex_provider_capacity"
+    assert metadata["retry_after_seconds"] == 44479
+    assert event["kind"] == "rate_limited"
+    assert json.loads(event["payload"])["credentials_state"] == "valid"
 
 
 def test_stale_worker_cannot_mutate_new_attempt(kanban_home: Path) -> None:
