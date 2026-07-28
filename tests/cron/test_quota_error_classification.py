@@ -80,7 +80,13 @@ def test_cron_quota_exhaustion_keeps_configured_fallback(monkeypatch, caplog):
     monkeypatch.setattr(
         cron_scheduler,
         "get_fallback_chain",
-        lambda config: [{"provider": "openrouter", "api_key": "fallback-key"}],
+        lambda config: [
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "api_key": "fallback-key",
+            }
+        ],
     )
 
     with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
@@ -100,6 +106,93 @@ def test_cron_quota_exhaustion_keeps_configured_fallback(monkeypatch, caplog):
         {"requested": "openrouter", "explicit_api_key": "fallback-key"},
     ]
     assert "primary provider quota/rate limit reached" in caplog.text
+
+
+def test_cron_fallback_replaces_primary_model(monkeypatch):
+    quota_error = AuthError(
+        "Codex provider quota exhausted (429); retry after 3600s.",
+        provider="openai-codex",
+        code=CODEX_RATE_LIMITED_CODE,
+        relogin_required=False,
+    )
+    resolver_calls = []
+
+    def _resolve(**kwargs):
+        resolver_calls.append(kwargs)
+        if len(resolver_calls) == 1:
+            raise quota_error
+        return {
+            "api_key": "gemini-key",
+            "base_url": "https://generativelanguage.googleapis.com",
+            "provider": "gemini",
+            "api_mode": "gemini",
+            "command": None,
+            "args": [],
+        }
+
+    _patch_resolution_only_run(monkeypatch, _resolve)
+    captured = []
+
+    class _CaptureAgent:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+            raise RuntimeError("stop after agent construction")
+
+    sys.modules["run_agent"].AIAgent = _CaptureAgent
+    monkeypatch.setattr(
+        cron_scheduler,
+        "get_fallback_chain",
+        lambda config: [
+            {"provider": "gemini", "model": "gemini-3-flash-preview"}
+        ],
+    )
+
+    success, _, _, error = cron_scheduler.run_job(
+        {
+            "id": "quota-model-handoff-job",
+            "name": "Quota Model Handoff Test",
+            "prompt": "ping",
+            "model": "gpt-5.6-terra",
+        }
+    )
+
+    assert success is False
+    assert "stop after agent construction" in error
+    assert captured[0]["provider"] == "gemini"
+    assert captured[0]["model"] == "gemini-3-flash-preview"
+
+
+def test_cron_skips_fallback_without_model(monkeypatch, caplog):
+    quota_error = AuthError(
+        "Codex provider quota exhausted (429); retry after 3600s.",
+        provider="openai-codex",
+        code=CODEX_RATE_LIMITED_CODE,
+        relogin_required=False,
+    )
+
+    def _resolve(**kwargs):
+        raise quota_error
+
+    _patch_resolution_only_run(monkeypatch, _resolve)
+    monkeypatch.setattr(
+        cron_scheduler,
+        "get_fallback_chain",
+        lambda config: [{"provider": "gemini"}],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+        success, _, _, error = cron_scheduler.run_job(
+            {
+                "id": "quota-missing-model-job",
+                "name": "Quota Missing Model Test",
+                "prompt": "ping",
+                "model": "gpt-5.6-terra",
+            }
+        )
+
+    assert success is False
+    assert "quota exhausted" in error
+    assert "skipping fallback gemini because no model is configured" in caplog.text
 
 
 def test_cron_real_auth_failure_keeps_auth_wording(monkeypatch, caplog):

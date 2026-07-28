@@ -2949,13 +2949,27 @@ def run_job(
             runtime = None
             for entry in fb_list:
                 try:
+                    fallback_model = str(entry.get("model") or "").strip()
+                    if not fallback_model:
+                        logger.warning(
+                            "Job '%s': skipping fallback %s because no model is configured",
+                            job_id,
+                            entry.get("provider"),
+                        )
+                        continue
                     fb_kwargs = {"requested": entry.get("provider")}
                     if entry.get("base_url"):
                         fb_kwargs["explicit_base_url"] = entry["base_url"]
                     if entry.get("api_key"):
                         fb_kwargs["explicit_api_key"] = entry["api_key"]
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
+                    model = fallback_model
+                    logger.info(
+                        "Job '%s': fallback resolved to %s model=%s",
+                        job_id,
+                        runtime.get("provider"),
+                        model,
+                    )
                     break
                 except Exception as fb_exc:
                     logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
