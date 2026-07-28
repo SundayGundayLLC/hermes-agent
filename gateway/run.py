@@ -43,7 +43,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -371,6 +371,123 @@ def _gateway_provider_error_reply(text: str) -> str:
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."
     )
+
+
+_CODEX_RETRY_AFTER_RE = re.compile(r"\bretry\s+after\s+(\d+)s\b", re.IGNORECASE)
+
+
+def _rate_limited_auth_cause(error: Exception) -> Optional[Exception]:
+    """Find the structured quota error through safe exception chaining."""
+    from hermes_cli.auth import is_rate_limited_auth_error
+
+    current: Optional[BaseException] = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if is_rate_limited_auth_error(current):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _codex_retry_at_text(error: Exception, *, now: Optional[datetime] = None) -> Optional[str]:
+    """Return the exact local Codex retry-window end without exposing raw errors."""
+    quota_error = _rate_limited_auth_cause(error)
+    if quota_error is None:
+        return None
+    match = _CODEX_RETRY_AFTER_RE.search(str(quota_error))
+    if not match:
+        return None
+    current = now or datetime.now().astimezone()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    retry_at = current + timedelta(seconds=int(match.group(1)))
+    return retry_at.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
+def _initial_quota_fallback_notice(
+    error: Exception,
+    *,
+    provider: Any,
+    model: Any,
+    now: Optional[datetime] = None,
+) -> Optional[dict]:
+    """Build user-safe notice metadata for a usable initial quota fallback."""
+    if _rate_limited_auth_cause(error) is None:
+        return None
+    retry_at = _codex_retry_at_text(error, now=now)
+    provider_id = str(provider or "").strip()
+    model_id = str(model or "").strip()
+    if not provider_id or not model_id:
+        return None
+    provider_name = "Gemini" if provider_id.lower() == "gemini" else provider_id
+    if retry_at:
+        availability = (
+            f"Codex is expected to be available again at {retry_at} "
+            "(provider retry window)."
+        )
+    else:
+        availability = (
+            "The provider did not supply an exact Codex availability time; "
+            "I will use a future provider retry window when one is available."
+        )
+    return {
+        "id": f"quota-fallback:{provider_id}:{model_id}",
+        "provider": provider_id,
+        "model": model_id,
+        "text": (
+            f"⚠️ Codex quota fallback: I’m temporarily using {provider_name} "
+            f"({model_id}). {availability} {provider_name} API usage may incur metered charges; "
+            "leave this bot idle to avoid additional fallback calls."
+        ),
+    }
+
+
+def _gateway_runtime_unavailable_reply(error: Exception) -> str:
+    """Return an honest, user-safe response when no initial fallback is usable."""
+    retry_at = _codex_retry_at_text(error)
+    if retry_at:
+        return (
+            f"⏱️ Codex is unavailable until {retry_at} (provider retry window). "
+            "No usable fallback was available, so no fallback API call or metered "
+            "fallback charge occurred."
+        )
+    if _rate_limited_auth_cause(error) is not None:
+        return (
+            "⏱️ Codex quota is exhausted, but the provider did not supply a usable "
+            "retry time. No usable fallback was available, so no fallback API call "
+            "or metered fallback charge occurred."
+        )
+    return f"⚠️ Provider authentication failed: {error}"
+
+
+def _prepend_successful_initial_fallback_notice(
+    agent: Any,
+    route: dict,
+    result: dict,
+    final_response: Any,
+) -> Any:
+    """Prepend the disclosure once, only after the configured fallback answered."""
+    notice = route.get("initial_fallback_notice")
+    response = str(final_response or "").strip()
+    if not isinstance(notice, dict) or not response:
+        return final_response
+    if result.get("error") or result.get("interrupted") or result.get("partial"):
+        return final_response
+    if int(result.get("api_calls") or 0) <= 0:
+        return final_response
+    if str(getattr(agent, "provider", "") or "") != str(notice.get("provider") or ""):
+        return final_response
+    if str(getattr(agent, "model", "") or "") != str(notice.get("model") or ""):
+        return final_response
+    notice_id = str(notice.get("id") or "")
+    notice_text = str(notice.get("text") or "").strip()
+    if not notice_id or not notice_text:
+        return final_response
+    if getattr(agent, "_gateway_initial_fallback_notice_id", None) == notice_id:
+        return final_response
+    setattr(agent, "_gateway_initial_fallback_notice_id", notice_id)
+    return f"{notice_text}\n\n{response}"
 
 
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
@@ -1865,7 +1982,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
         else:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
+        fb_config = _try_resolve_fallback_provider(primary_error=auth_exc)
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
@@ -1942,7 +2059,7 @@ def _credential_pool_for_provider(provider: Optional[str]):
         return None
 
 
-def _try_resolve_fallback_provider() -> dict | None:
+def _try_resolve_fallback_provider(primary_error: Optional[Exception] = None) -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
@@ -1978,7 +2095,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     entry.get("provider") or runtime.get("provider"),
                     entry.get("model"),
                 )
-                return {
+                result = {
                     "api_key": runtime.get("api_key"),
                     "base_url": runtime.get("base_url"),
                     "provider": runtime.get("provider"),
@@ -1988,6 +2105,14 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
                 }
+                notice = _initial_quota_fallback_notice(
+                    primary_error,
+                    provider=runtime.get("provider"),
+                    model=entry.get("model"),
+                ) if primary_error is not None else None
+                if notice is not None:
+                    result["initial_fallback_notice"] = notice
+                return result
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
                 continue
@@ -3911,6 +4036,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         route = {
             "model": model,
             "runtime": runtime,
+            "initial_fallback_notice": runtime_kwargs.get("initial_fallback_notice"),
             "signature": (
                 model,
                 runtime["provider"],
@@ -18185,7 +18311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as exc:
                 return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
+                    "final_response": _gateway_runtime_unavailable_reply(exc),
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -19302,6 +19428,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+
+            final_response = _prepend_successful_initial_fallback_notice(
+                agent,
+                turn_route,
+                result,
+                final_response,
+            )
             
             # Auto-generate session title after first exchange (non-blocking)
             if final_response and self._session_db:
