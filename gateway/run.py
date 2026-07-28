@@ -472,7 +472,13 @@ def _prepend_successful_initial_fallback_notice(
     response = str(final_response or "").strip()
     if not isinstance(notice, dict) or not response:
         return final_response
-    if result.get("error") or result.get("interrupted") or result.get("partial"):
+    if (
+        result.get("error")
+        or result.get("interrupted")
+        or result.get("partial")
+        or result.get("failed")
+        or result.get("completed") is False
+    ):
         return final_response
     if int(result.get("api_calls") or 0) <= 0:
         return final_response

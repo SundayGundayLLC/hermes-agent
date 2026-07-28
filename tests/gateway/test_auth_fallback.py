@@ -242,3 +242,29 @@ def test_initial_fallback_notice_rejects_provider_mismatch():
     assert _prepend_successful_initial_fallback_notice(
         agent, route, {"api_calls": 1}, "codex answer"
     ) == "codex answer"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"api_calls": 1, "failed": True},
+        {"api_calls": 1, "completed": False},
+    ],
+)
+def test_initial_fallback_notice_rejects_unsuccessful_result_state(result):
+    from gateway.run import _prepend_successful_initial_fallback_notice
+
+    agent = SimpleNamespace(provider="gemini", model="gemini-3-flash-preview")
+    route = {
+        "initial_fallback_notice": {
+            "id": "gemini:gemini-3-flash-preview:reset",
+            "provider": "gemini",
+            "model": "gemini-3-flash-preview",
+            "text": "fallback disclosure",
+        }
+    }
+
+    assert _prepend_successful_initial_fallback_notice(
+        agent, route, result, "unsuccessful reply"
+    ) == "unsuccessful reply"
+    assert not hasattr(agent, "_gateway_initial_fallback_notice_id")
