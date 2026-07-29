@@ -1512,7 +1512,12 @@ DEFAULT_CONFIG = {
                                       # Hermes' compression threshold triggers
                                       # thread/compact/start; off = never auto-trigger
                                       # (codex may still compact natively).
-        "in_place": True,             # When True, compaction rewrites the message
+        "in_place": False,            # SDGD fork: fail closed while upstream #68858
+                                      # remains open. Large live state stores can
+                                      # amplify status-only FTS rewrites during
+                                      # in-place compaction and wedge the gateway.
+                                      # Explicit per-profile opt-in remains available.
+                                      # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation
                                       # keeps one durable id for its whole life
@@ -1526,8 +1531,8 @@ DEFAULT_CONFIG = {
                                       # turns are soft-archived under the same id
                                       # (active=0, compacted=1) — still searchable via
                                       # session_search and recoverable, not deleted.
-                                      # Default False during rollout; will flip on
-                                      # after live validation.
+                                      # Keep False until the narrowed-trigger migration
+                                      # and sustained large-store canary are verified.
     },
 
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
