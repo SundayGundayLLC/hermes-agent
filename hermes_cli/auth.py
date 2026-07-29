@@ -756,6 +756,23 @@ def _normalize_lmstudio_runtime_base_url(base_url: str) -> str:
 # they must be kept distinct from missing/expired-credential errors.
 CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
 
+_RATE_LIMITED_AUTH_ERROR_CODES = frozenset(
+    {
+        CODEX_RATE_LIMITED_CODE,
+        "usage_limit_reached",
+        "rate_limit_exceeded",
+        "rate_limited",
+        "quota_exceeded",
+        "quota_exhausted",
+    }
+)
+
+_RATE_LIMITED_AUTH_ERROR_MARKERS = (
+    "usage_limit_reached",
+    "rate_limit_exceeded",
+    "quota_exhausted",
+)
+
 
 class AuthError(RuntimeError):
     """Structured auth error with UX mapping hints."""
@@ -782,11 +799,19 @@ def is_rate_limited_auth_error(error: Exception) -> bool:
     callers should surface a "retry later" notice and prefer a fallback chain
     instead of prompting the operator to run ``hermes auth``.
     """
-    return (
-        isinstance(error, AuthError)
-        and not error.relogin_required
-        and error.code == CODEX_RATE_LIMITED_CODE
-    )
+    if not isinstance(error, AuthError) or error.relogin_required:
+        return False
+
+    code = str(error.code or "").strip().lower().replace("-", "_")
+    if code in _RATE_LIMITED_AUTH_ERROR_CODES:
+        return True
+
+    # Older provider adapters sometimes preserve the upstream machine code in
+    # the message instead of copying it into AuthError.code.  Match only the
+    # explicit machine-readable quota markers here; broad prose such as
+    # "limit" or "quota" could otherwise hide a genuine credential failure.
+    message = str(error).lower().replace("-", "_")
+    return any(marker in message for marker in _RATE_LIMITED_AUTH_ERROR_MARKERS)
 
 
 def _parse_retry_after_seconds(headers: Any) -> Optional[int]:

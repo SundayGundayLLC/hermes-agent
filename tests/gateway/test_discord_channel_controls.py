@@ -56,10 +56,18 @@ class FakeDMChannel:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
+    def __init__(
+        self,
+        channel_id: int = 1,
+        name: str = "general",
+        guild_name: str = "Hermes Server",
+        category=None,
+    ):
         self.id = channel_id
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
+        self.category = category
+        self.category_id = getattr(category, "id", None)
         self.topic = None
 
 
@@ -196,6 +204,40 @@ async def test_ignored_channel_thread_parent_match(adapter, monkeypatch):
     await adapter._handle_message(message)
 
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ignored_channel_category_parent_match(adapter, monkeypatch):
+    """Text channel whose category is ignored should also be ignored."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_IGNORED_CHANNELS", "500")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    category = SimpleNamespace(id=500, name="campaigns")
+    channel = FakeTextChannel(channel_id=501, name="campaign", category=category)
+    message = make_message(channel=channel, content="hello from campaign")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_allowed_channel_category_parent_match(adapter, monkeypatch):
+    """A category allowlist entry admits each text channel below it."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "500")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    category = SimpleNamespace(id=500, name="campaigns")
+    channel = FakeTextChannel(channel_id=501, name="campaign", category=category)
+    message = make_message(channel=channel, content="hello from campaign")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter._get_parent_channel_id(channel) == "500"
+    assert {"500", "campaigns", "#campaigns"} <= adapter._discord_channel_keys(message)
 
 
 @pytest.mark.asyncio

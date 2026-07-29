@@ -973,6 +973,58 @@ def test_is_rate_limited_auth_error_distinguishes_credential_errors():
     assert is_rate_limited_auth_error(ValueError("nope")) is False
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        "usage_limit_reached",
+        "rate-limit-exceeded",
+        "rate_limited",
+        "quota_exceeded",
+        "quota_exhausted",
+    ],
+)
+def test_is_rate_limited_auth_error_accepts_upstream_quota_codes(code):
+    """Provider-native quota codes remain capacity failures, not auth failures."""
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+
+    error = AuthError(
+        "OpenAI Codex capacity is exhausted",
+        provider="openai-codex",
+        code=code,
+        relogin_required=False,
+    )
+
+    assert is_rate_limited_auth_error(error) is True
+
+
+def test_is_rate_limited_auth_error_accepts_legacy_machine_code_message():
+    """Legacy adapters may leave usage_limit_reached in the message only."""
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+
+    error = AuthError(
+        '{"error":{"type":"usage_limit_reached"}}',
+        provider="openai-codex",
+        code="codex_refresh_failed",
+        relogin_required=False,
+    )
+
+    assert is_rate_limited_auth_error(error) is True
+
+
+def test_is_rate_limited_auth_error_never_overrides_relogin_requirement():
+    """A terminal credential signal wins even if upstream text mentions quota."""
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+
+    error = AuthError(
+        "usage_limit_reached while refreshing a revoked token",
+        provider="openai-codex",
+        code="invalid_grant",
+        relogin_required=True,
+    )
+
+    assert is_rate_limited_auth_error(error) is False
+
+
 def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypatch):
     called = {"device_login": 0}
 

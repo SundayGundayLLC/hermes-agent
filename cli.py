@@ -15994,6 +15994,18 @@ def main(
                         ):
                             cli.session_id = cli.agent.session_id
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        if isinstance(result, dict) and result.get("failed"):
+                            try:
+                                from hermes_cli.kanban_worker_diagnostics import (
+                                    record_kanban_worker_failure,
+                                )
+
+                                record_kanban_worker_failure(cli, result)
+                            except Exception:
+                                logger.warning(
+                                    "failed to persist Kanban worker diagnostic",
+                                    exc_info=True,
+                                )
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout
@@ -16015,11 +16027,18 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
-                            try:
-                                _run_kanban_goal_loop_q(cli, response)
-                            except Exception as _goal_exc:
-                                logger.debug("kanban goal loop failed: %s", _goal_exc)
+                        if (
+                            os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                        ):
+                            from hermes_cli.kanban_worker_diagnostics import (
+                                should_continue_kanban_goal_loop,
+                            )
+
+                            if should_continue_kanban_goal_loop(result):
+                                try:
+                                    _run_kanban_goal_loop_q(cli, response)
+                                except Exception as _goal_exc:
+                                    logger.debug("kanban goal loop failed: %s", _goal_exc)
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)

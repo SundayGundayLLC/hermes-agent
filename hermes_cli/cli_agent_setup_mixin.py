@@ -15,6 +15,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 from __future__ import annotations
 
 import sys
+import os
 
 from rich.markup import escape as _escape
 
@@ -36,6 +37,10 @@ class CLIAgentSetupMixin:
         )
 
         _primary_exc = None
+        _primary_provider = (
+            self.requested_provider or getattr(self, "provider", "") or ""
+        ).strip().lower()
+        self._kanban_primary_provider_failure = None
         runtime = None
         try:
             runtime = resolve_runtime_provider(
@@ -70,6 +75,19 @@ class CLIAgentSetupMixin:
                             "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,
                         )
+                        if os.environ.get("HERMES_KANBAN_TASK"):
+                            from hermes_cli.kanban_worker_diagnostics import (
+                                classify_primary_provider_failure,
+                            )
+
+                            self._kanban_primary_provider_failure = (
+                                classify_primary_provider_failure(
+                                    _primary_exc,
+                                    provider=_primary_provider,
+                                    fallback_provider=_fb_provider,
+                                    fallback_model=_fb_model,
+                                )
+                            )
                         _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
                         self.requested_provider = _fb_provider
                         self.model = _fb_model

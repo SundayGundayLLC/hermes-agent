@@ -21,6 +21,7 @@ def _make_runner(proxy_url=None):
     runner._session_model_overrides = {}
     runner._agent_cache = {}
     runner._agent_cache_lock = None
+    runner.hooks = MagicMock()
     return runner
 
 

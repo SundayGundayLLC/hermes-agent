@@ -3149,7 +3149,7 @@ def run_job(
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
-        from hermes_cli.auth import AuthError
+        from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
         # F8 runtime backstop: never resolve a stored provider/base_url pair that
         # would ship a named provider's stored credential to an off-host endpoint
@@ -3199,7 +3199,23 @@ def run_job(
                 str(getattr(auth_exc, "provider", "") or "").strip().lower()
                 or primary_provider_for_drift
             )
-            logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
+            # Quota exhaustion is transported as AuthError for compatibility,
+            # but the credentials are still valid and re-auth cannot help.
+            # Preserve the configured fallback behavior while keeping the
+            # operator-facing diagnosis accurate.
+            if is_rate_limited_auth_error(auth_exc):
+                logger.warning(
+                    "Job '%s': primary provider quota/rate limit reached (%s), "
+                    "trying fallback",
+                    job_id,
+                    auth_exc,
+                )
+            else:
+                logger.warning(
+                    "Job '%s': primary auth failed (%s), trying fallback",
+                    job_id,
+                    auth_exc,
+                )
             fb_list = get_fallback_chain(_cfg)
             runtime = None
             for entry in fb_list:
@@ -3207,7 +3223,14 @@ def run_job(
                     continue
                 fb_provider = str(entry.get("provider") or "").strip()
                 fb_model = str(entry.get("model") or "").strip()
-                if not fb_provider or not fb_model:
+                if not fb_provider:
+                    continue
+                if not fb_model:
+                    logger.warning(
+                        "Job '%s': skipping fallback %s because no model is configured",
+                        job_id,
+                        fb_provider,
+                    )
                     continue
                 try:
                     from hermes_cli.fallback_config import resolve_entry_api_key

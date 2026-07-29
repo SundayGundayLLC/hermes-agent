@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -58,8 +60,13 @@ agent:
     )
     root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env", lambda _name: str(profile)
+    )
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
 
@@ -99,9 +106,15 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     (root / "profiles" / "elias").mkdir(parents=True)
     root.joinpath("config.yaml").write_text("display:\n  interface: tui\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     monkeypatch.setenv("HERMES_TUI", "1")
 
     from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _name: str(root / "profiles" / "elias"),
+    )
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
 
@@ -197,3 +210,14 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_worker_toolset_resolution_fails_closed(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: (_ for _ in ()).throw(ValueError("bad profile config")),
+    )
+    with pytest.raises(RuntimeError, match="could not resolve assigned profile"):
+        kb._resolve_worker_cli_toolsets(str(tmp_path / "profile"))

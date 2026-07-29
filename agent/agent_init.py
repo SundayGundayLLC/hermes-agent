@@ -346,6 +346,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    pre_delivery_callback: Optional[Callable[[dict], dict]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -571,6 +572,7 @@ def init_agent(
     agent.notice_clear_callback = notice_clear_callback
     agent.event_callback = event_callback
     agent.reaction_callback = reaction_callback
+    agent.pre_delivery_callback = pre_delivery_callback
     agent.tool_gen_callback = tool_gen_callback
 
     
