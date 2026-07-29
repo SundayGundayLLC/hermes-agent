@@ -102,8 +102,12 @@ def test_cron_quota_exhaustion_keeps_configured_fallback(monkeypatch, caplog):
     assert success is False
     assert "Codex quota exhausted" in error
     assert resolver_calls == [
-        {"requested": None},
-        {"requested": "openrouter", "explicit_api_key": "fallback-key"},
+        {"requested": None, "target_model": "gpt-5-codex"},
+        {
+            "requested": "openrouter",
+            "target_model": "anthropic/claude-sonnet-4.6",
+            "explicit_api_key": "fallback-key",
+        },
     ]
     assert "primary provider quota/rate limit reached" in caplog.text
 
